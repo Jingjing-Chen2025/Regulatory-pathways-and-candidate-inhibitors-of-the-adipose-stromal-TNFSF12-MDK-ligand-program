@@ -1,0 +1,343 @@
+# Selleck Chemicals Compound Analysis - FDA Approved Medicines
+# Date: 2025-08-04 05:11:06
+# User: Jingjing-Chen2025
+
+# Load required libraries
+library(readxl)
+library(writexl)
+library(dplyr)
+library(stringr)
+
+cat("===========================================\n")
+cat("Selleck Chemicals - FDA Approved Medicines Analysis\n")
+cat("Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "UTC\n")
+cat("User: Jingjing-Chen2025\n")
+cat("===========================================\n\n")
+
+# Define file paths
+input_file <- "/Users/cj719/kinase_TF_regulation_PhosphoSitePlus.xlsx"
+output_file <- "/Users/cj719/selleck_approved_medicines_TF_kinase.xlsx"
+
+# ========== 1. READ TARGET PROTEINS FROM EXCEL ==========
+cat("Reading target proteins from Excel file...\n")
+
+# Check available sheets
+sheets <- excel_sheets(input_file)
+cat("Available sheets:", paste(sheets, collapse = ", "), "\n")
+
+# Read the main data sheet
+if ("Kinase_TF_Relationships" %in% sheets) {
+  target_data <- read_excel(input_file, sheet = "Kinase_TF_Relationships")
+} else {
+  target_data <- read_excel(input_file, sheet = 1)
+}
+
+# Extract unique TFs and Kinases
+unique_tfs <- unique(target_data$TF)
+unique_kinases <- unique(target_data$Kinase)
+all_targets <- unique(c(unique_tfs, unique_kinases))
+
+cat("\nTarget proteins identified:\n")
+cat("  Transcription Factors:", length(unique_tfs), "\n")
+cat("  Kinases:", length(unique_kinases), "\n")
+cat("  Total unique targets:", length(all_targets), "\n")
+
+# ========== 2. CREATE FDA APPROVED MEDICINES DATABASE ==========
+cat("\n========== CREATING DATABASE OF FDA APPROVED COMPOUNDS ==========\n")
+
+# Create a simpler, cleaner database focusing on FDA approved medicines only
+fda_approved_medicines <- data.frame(
+  Generic_Name = c(
+    # AR antagonists
+    "Enzalutamide", "Bicalutamide", "Apalutamide", "Darolutamide", "Flutamide", "Nilutamide",
+    # ESR1 modulators
+    "Fulvestrant", "Tamoxifen", "Raloxifene", "Toremifene", "Letrozole", "Anastrozole",
+    "Exemestane", "Bazedoxifene", "Elacestrant",
+    # MEK inhibitors
+    "Trametinib", "Cobimetinib", "Binimetinib", "Selumetinib",
+    # CDK4/6 inhibitors
+    "Palbociclib", "Ribociclib", "Abemaciclib", "Trilaciclib",
+    # Bcr-Abl/SRC inhibitors
+    "Dasatinib", "Bosutinib", "Ponatinib",
+    # Multi-kinase inhibitors
+    "Sorafenib", "Sunitinib", "Regorafenib", "Cabozantinib", "Lenvatinib", 
+    "Pazopanib", "Axitinib", "Vandetanib", "Nintedanib"
+  ),
+  
+  Trade_Name = c(
+    # AR
+    "Xtandi", "Casodex", "Erleada", "Nubeqa", "Eulexin", "Nilandron",
+    # ESR1
+    "Faslodex", "Nolvadex", "Evista", "Fareston", "Femara", "Arimidex",
+    "Aromasin", "Duavee", "Orserdu",
+    # MEK
+    "Mekinist", "Cotellic", "Mektovi", "Koselugo",
+    # CDK
+    "Ibrance", "Kisqali", "Verzenio", "Cosela",
+    # Bcr-Abl/SRC
+    "Sprycel", "Bosulif", "Iclusig",
+    # Multi
+    "Nexavar", "Sutent", "Stivarga", "Cabometyx/Cometriq", "Lenvima", 
+    "Votrient", "Inlyta", "Caprelsa", "Ofev"
+  ),
+  
+  Target = c(
+    # AR
+    rep("AR", 6),
+    # ESR1
+    rep("ESR1", 9),
+    # MEK
+    rep("MAPK1/MAPK3", 4),
+    # CDK
+    rep("CDK4/CDK6", 4),
+    # Bcr-Abl/SRC
+    rep("SRC/BCR-ABL", 3),
+    # Multi
+    rep("Multiple kinases", 9)
+  ),
+  
+  Target_Type = c(
+    rep("Transcription Factor", 15),
+    rep("Kinase", 20)
+  ),
+  
+  Approval_Year = c(
+    # AR
+    2012, 1995, 2018, 2019, 1989, 1996,
+    # ESR1
+    2002, 1977, 1997, 1997, 1997, 1995, 1999, 2013, 2022,
+    # MEK
+    2013, 2015, 2018, 2020,
+    # CDK
+    2015, 2017, 2017, 2021,
+    # Bcr-Abl/SRC
+    2006, 2012, 2012,
+    # Multi
+    2005, 2006, 2012, 2012, 2015, 2009, 2012, 2011, 2014
+  ),
+  
+  Primary_Indication = c(
+    # AR
+    rep("Prostate Cancer", 6),
+    # ESR1
+    "Breast Cancer", "Breast Cancer", "Osteoporosis", "Breast Cancer",
+    "Breast Cancer", "Breast Cancer", "Breast Cancer", "Osteoporosis", "Breast Cancer",
+    # MEK
+    "Melanoma", "Melanoma", "Melanoma", "Neurofibromatosis",
+    # CDK
+    "Breast Cancer", "Breast Cancer", "Breast Cancer", "Small Cell Lung Cancer",
+    # Bcr-Abl/SRC
+    "CML/ALL", "CML", "CML/ALL",
+    # Multi
+    "Kidney/Liver Cancer", "Kidney Cancer", "Colorectal Cancer", "Kidney/Thyroid Cancer",
+    "Thyroid/Liver Cancer", "Kidney Cancer", "Kidney Cancer", "Thyroid Cancer", "IPF"
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+cat("Created database with", nrow(fda_approved_medicines), "FDA approved medicines\n")
+
+# ========== 3. MATCH APPROVED MEDICINES TO TARGET PROTEINS ==========
+cat("\nMatching approved medicines to target proteins...\n")
+
+# Initialize results
+matched_medicines <- data.frame()
+
+# Function to check if target matches
+match_targets <- function(drug_target, protein_list) {
+  # Split multiple targets
+  targets <- unlist(str_split(drug_target, "[/,]"))
+  targets <- trimws(targets)
+  
+  # Check for matches
+  matches <- protein_list[protein_list %in% targets]
+  
+  # Special cases for kinase families
+  if (length(matches) == 0) {
+    if (grepl("CDK", drug_target)) {
+      cdk_matches <- protein_list[grep("^CDK", protein_list)]
+      matches <- c(matches, cdk_matches)
+    }
+    if (grepl("MAPK", drug_target)) {
+      mapk_matches <- protein_list[grep("^MAPK", protein_list)]
+      matches <- c(matches, mapk_matches)
+    }
+    if (drug_target == "Multiple kinases") {
+      # Common targets of multi-kinase inhibitors
+      multi_targets <- c("MAPK1", "MAPK3", "SRC", "AKT1", "VEGFR2", "PDGFR")
+      matches <- protein_list[protein_list %in% multi_targets]
+    }
+  }
+  
+  return(unique(matches))
+}
+
+# Match each medicine to targets
+for (i in 1:nrow(fda_approved_medicines)) {
+  drug <- fda_approved_medicines[i, ]
+  
+  # Check TFs
+  tf_matches <- match_targets(drug$Target, unique_tfs)
+  for (tf in tf_matches) {
+    matched_medicines <- rbind(matched_medicines, data.frame(
+      Generic_Name = drug$Generic_Name,
+      Trade_Name = drug$Trade_Name,
+      Target = tf,
+      Target_Type = "Transcription Factor",
+      Approval_Year = drug$Approval_Year,
+      Primary_Indication = drug$Primary_Indication,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Check Kinases
+  kinase_matches <- match_targets(drug$Target, unique_kinases)
+  for (kinase in kinase_matches) {
+    matched_medicines <- rbind(matched_medicines, data.frame(
+      Generic_Name = drug$Generic_Name,
+      Trade_Name = drug$Trade_Name,
+      Target = kinase,
+      Target_Type = "Kinase",
+      Approval_Year = drug$Approval_Year,
+      Primary_Indication = drug$Primary_Indication,
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+# Remove duplicates
+matched_medicines <- matched_medicines %>% distinct()
+
+cat("Found", nrow(matched_medicines), "medicine-target matches\n")
+
+# ========== 4. CREATE SUMMARIES ==========
+cat("\n========== CREATING OUTPUT SUMMARIES ==========\n")
+
+# Summary by medicine
+medicine_summary <- matched_medicines %>%
+  group_by(Generic_Name, Trade_Name, Approval_Year, Primary_Indication) %>%
+  summarise(
+    n_targets = n(),
+    targets = paste(unique(Target), collapse = ", "),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(n_targets), Approval_Year)
+
+# Summary by target
+target_summary <- matched_medicines %>%
+  group_by(Target, Target_Type) %>%
+  summarise(
+    n_drugs = n(),
+    drugs = paste(unique(Generic_Name), collapse = "; "),
+    .groups = 'drop'
+  ) %>%
+  arrange(Target_Type, desc(n_drugs))
+
+# Recent approvals
+recent_approvals <- fda_approved_medicines %>%
+  filter(Approval_Year >= 2020) %>%
+  arrange(desc(Approval_Year))
+
+# Analysis metadata
+metadata <- data.frame(
+  Parameter = c(
+    "Analysis Date",
+    "User",
+    "Total FDA approved medicines analyzed",
+    "Medicines matching target proteins",
+    "Unique medicines with matches",
+    "TFs with approved drugs",
+    "Kinases with approved drugs",
+    "Newest approved drug",
+    "Oldest approved drug"
+  ),
+  Value = c(
+    "2025-08-04 05:11:06 UTC",
+    "Jingjing-Chen2025",
+    nrow(fda_approved_medicines),
+    nrow(matched_medicines),
+    length(unique(matched_medicines$Generic_Name)),
+    sum(target_summary$Target_Type == "Transcription Factor"),
+    sum(target_summary$Target_Type == "Kinase"),
+    paste0(recent_approvals$Generic_Name[1], " (", recent_approvals$Approval_Year[1], ")"),
+    "Tamoxifen (1977)"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ========== 5. EXPORT TO EXCEL ==========
+cat("\nExporting results to Excel...\n")
+
+# Create Excel workbook
+excel_sheets <- list(
+  "Matched_Medicines" = matched_medicines,
+  "Medicine_Summary" = medicine_summary,
+  "Target_Summary" = target_summary,
+  "All_FDA_Approved" = fda_approved_medicines,
+  "Recent_Approvals" = recent_approvals,
+  "Analysis_Info" = metadata
+)
+
+# Write to Excel
+write_xlsx(excel_sheets, output_file)
+
+cat("Results exported to:", output_file, "\n")
+
+# ========== 6. DISPLAY KEY FINDINGS ==========
+cat("\n========== KEY FINDINGS ==========\n")
+
+# Display matched medicines
+if (nrow(matched_medicines) > 0) {
+  cat("\nFDA Approved Medicines Matching Your Targets:\n")
+  
+  # TFs with drugs
+  tf_matches <- matched_medicines %>% 
+    filter(Target_Type == "Transcription Factor") %>%
+    group_by(Target) %>%
+    summarise(
+      drugs = paste(unique(Generic_Name), collapse = ", "),
+      .groups = 'drop'
+    )
+  
+  if (nrow(tf_matches) > 0) {
+    cat("\nTranscription Factors:\n")
+    for (i in 1:nrow(tf_matches)) {
+      cat(sprintf("  %s: %s\n", tf_matches$Target[i], tf_matches$drugs[i]))
+    }
+  }
+  
+  # Kinases with drugs
+  kinase_matches <- matched_medicines %>% 
+    filter(Target_Type == "Kinase") %>%
+    group_by(Target) %>%
+    summarise(
+      n_drugs = n_distinct(Generic_Name),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(n_drugs)) %>%
+    head(10)
+  
+  if (nrow(kinase_matches) > 0) {
+    cat("\nTop Kinases (by number of drugs):\n")
+    for (i in 1:nrow(kinase_matches)) {
+      cat(sprintf("  %s: %d drugs\n", kinase_matches$Target[i], kinase_matches$n_drugs[i]))
+    }
+  }
+}
+
+# Recent approvals
+cat("\nRecently Approved Drugs (2020+):\n")
+for (i in 1:nrow(recent_approvals)) {
+  cat(sprintf("  %s (%s) - %s, approved %d for %s\n",
+              recent_approvals$Generic_Name[i],
+              recent_approvals$Trade_Name[i],
+              recent_approvals$Target[i],
+              recent_approvals$Approval_Year[i],
+              recent_approvals$Primary_Indication[i]))
+}
+
+cat("\n===========================================\n")
+cat("Analysis completed at: 2025-08-04 05:11:06 UTC\n")
+cat("Output file:", output_file, "\n")
+cat("===========================================\n")
