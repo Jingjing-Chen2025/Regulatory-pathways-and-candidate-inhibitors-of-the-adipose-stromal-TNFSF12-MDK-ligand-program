@@ -1,0 +1,44 @@
+# Manual approach using a downloaded conversion file
+# Download mouse-human orthologs from: http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt
+
+# Load required libraries
+library(readxl)
+library(dplyr)
+library(openxlsx)
+
+# Define file paths
+tfbs_file <- "/Users/cj719/MDK_promoter_TFBS_overlaps.xlsx"
+marker_file <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/Single cell sequencing data/cluster.markers.sig.csv"
+output_file <- "/Users/cj719/TF_overlap_c5_results.xlsx"
+
+# Read data
+tfbs_data <- read_excel(tfbs_file)
+TFs <- unique(tfbs_data$TF)
+
+markers <- read.csv(marker_file)
+c5_genes <- markers %>% filter(cluster == "c5") %>% pull(gene) %>% unique()
+
+# Direct comparison (assuming many TFs have conserved names)
+# Many transcription factors have the same symbol in mouse and human
+overlapping_TFs <- intersect(toupper(TFs), toupper(c5_genes))
+
+# Get the original case TFs
+overlapping_TFs_original <- TFs[toupper(TFs) %in% overlapping_TFs]
+
+# Create output
+output_df <- data.frame(
+  TF = overlapping_TFs_original,
+  found_in_c5 = "Yes",
+  stringsAsFactors = FALSE
+)
+
+# Save results
+write.xlsx(output_df, output_file, rowNames = FALSE)
+
+cat("Analysis complete!\n")
+cat("Found", nrow(output_df), "overlapping TFs\n")
+cat("Results saved to:", output_file, "\n")
+
+if (nrow(output_df) > 0) {
+  print(output_df)
+}
