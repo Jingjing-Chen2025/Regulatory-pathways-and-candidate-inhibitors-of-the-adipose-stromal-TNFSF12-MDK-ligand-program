@@ -1,0 +1,216 @@
+# ==============================
+# Load required libraries
+# ==============================
+library(biomaRt)
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(httr)
+library(jsonlite)
+library(gridExtra)
+library(scales)
+
+# ==============================
+# Set up parameters
+# ==============================
+gene_symbol <- "MDK"
+transcript_id <- "NM_001012334.2"
+gene_id <- 4192
+tss_position <- 46381068
+chromosome <- "chr11"
+upstream <- 50000
+downstream <- 50000
+
+# Define the promoter region
+promoter_start <- tss_position - upstream
+promoter_end <- tss_position + downstream
+promoter_region <- GRanges(seqnames = chromosome,
+                           ranges = IRanges(start = promoter_start, end = promoter_end))
+
+cat("MDK promoter region:", chromosome, ":", promoter_start, "-", promoter_end, "\n")
+cat("TSS position:", tss_position, "\n")
+
+# ==============================
+# Combine all signal data
+# ==============================
+# Make sure your signal_data has columns: mark, relative_position, score
+combined_data <- bind_rows(signal_data)
+
+# Create bins for smoother visualization (1kb bins)
+bin_size <- 1000
+combined_data$bin <- floor(combined_data$relative_position / bin_size) * bin_size
+
+# Aggregate data by bins
+binned_data <- combined_data %>%
+  group_by(mark, bin) %>%
+  summarise(mean_signal = mean(score, na.rm = TRUE),
+            .groups = 'drop')
+
+# ==============================
+# Define regulatory regions based on signal patterns
+# ==============================
+define_regulatory_regions <- function(binned_data) {
+  regions <- list()
+  
+  # Core Promoter: -2kb to +2kb around TSS with high H3K4me3
+  h3k4me3_data <- binned_data %>%
+    filter(mark == "H3K4me3", bin >= -2000, bin <= 2000)
+  
+  if (nrow(h3k4me3_data) > 0) {
+    h3k4me3_threshold <- quantile(h3k4me3_data$mean_signal, 0.75, na.rm = TRUE)
+    core_promoter <- h3k4me3_data %>%
+      filter(mean_signal > h3k4me3_threshold)
+    
+    if (nrow(core_promoter) > 0) {
+      regions$Core_Promoter <- data.frame(
+        start = min(core_promoter$bin) + tss_position,
+        end = max(core_promoter$bin) + tss_position + bin_size,
+        relative_start = min(core_promoter$bin),
+        relative_end = max(core_promoter$bin) + bin_size,
+        type = "Core_Promoter"
+      )
+    }
+  }
+  
+  # Active Chromatin: High H3K27ac and ATAC-seq signal
+  active_data <- binned_data %>%
+    filter(mark %in% c("H3K27ac", "ATAC-seq")) %>%
+    group_by(bin) %>%
+    summarise(combined_signal = sum(mean_signal, na.rm = TRUE)) %>%
+    filter(combined_signal > quantile(combined_signal, 0.7, na.rm = TRUE))
+  
+  if (nrow(active_data) > 0) {
+    active_data <- active_data %>% arrange(bin)
+    gaps <- which(diff(active_data$bin) > bin_size)
+    start_idx <- c(1, gaps + 1)
+    end_idx <- c(gaps, nrow(active_data))
+    active_regions <- data.frame()
+    for (i in seq_along(start_idx)) {
+      region_data <- active_data[start_idx[i]:end_idx[i], ]
+      active_regions <- rbind(active_regions, data.frame(
+        start = min(region_data$bin) + tss_position,
+        end = max(region_data$bin) + tss_position + bin_size,
+        relative_start = min(region_data$bin),
+        relative_end = max(region_data$bin) + bin_size,
+        type = "Active_Chromatin"
+      ))
+    }
+    regions$Active_Chromatin <- active_regions
+  }
+  
+  # Active Enhancer: High H3K4me1 and H3K27ac, low H3K4me3
+  enhancer_data <- binned_data %>%
+    pivot_wider(names_from = mark, values_from = mean_signal, values_fill = 0) %>%
+    filter(!is.na(H3K4me1) & !is.na(H3K27ac) & !is.na(H3K4me3)) %>%
+    mutate(enhancer_score = (H3K4me1 + H3K27ac) / (H3K4me3 + 1)) %>%
+    filter(enhancer_score > quantile(enhancer_score, 0.8, na.rm = TRUE))
+  
+  if (nrow(enhancer_data) > 0) {
+    enhancer_data <- enhancer_data %>% arrange(bin)
+    gaps <- which(diff(enhancer_data$bin) > bin_size)
+    start_idx <- c(1, gaps + 1)
+    end_idx <- c(gaps, nrow(enhancer_data))
+    enhancer_regions <- data.frame()
+    for (i in seq_along(start_idx)) {
+      region_data <- enhancer_data[start_idx[i]:end_idx[i], ]
+      enhancer_regions <- rbind(enhancer_regions, data.frame(
+        start = min(region_data$bin) + tss_position,
+        end = max(region_data$bin) + tss_position + bin_size,
+        relative_start = min(region_data$bin),
+        relative_end = max(region_data$bin) + bin_size,
+        type = "Active_Enhancer"
+      ))
+    }
+    regions$Active_Enhancer <- enhancer_regions
+  }
+  
+  return(regions)
+}
+
+# Identify regulatory regions
+regulatory_regions <- define_regulatory_regions(binned_data)
+all_regions <- bind_rows(regulatory_regions)
+
+if (nrow(all_regions) > 0) {
+  all_regions$chromosome <- chromosome
+  all_regions <- dplyr::select(all_regions, chromosome, start, end, relative_start, relative_end, type)
+}
+
+# ==============================
+# Create merged plot with all signals, regulatory regions (no font labels)
+# ==============================
+p_merged_actual <- ggplot() +
+  # Add regulatory region shading (no text)
+  geom_rect(
+    data = all_regions,
+    aes(
+      xmin = relative_start / 1000,
+      xmax = relative_end / 1000,
+      ymin = -Inf,
+      ymax = Inf,
+      fill = type
+    ),
+    alpha = 0.18,
+    inherit.aes = FALSE
+  ) +
+  # Signal lines
+  geom_line(
+    data = binned_data,
+    aes(x = bin / 1000, y = mean_signal, color = mark),
+    size = 1.5, alpha = 0.85
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+  scale_x_continuous(
+    breaks = seq(-50, 50, by = 10),
+    limits = c(-50, 50)
+  ) +
+  scale_y_continuous(
+    name = "Signal Intensity",
+    labels = scales::comma_format()
+  ) +
+  scale_color_manual(
+    values = c(
+      "H3K4me3" = "#E41A1C",
+      "H3K4me1" = "#377EB8", 
+      "H3K27ac" = "#4DAF4A",
+      "H3K27me3" = "#984EA3",
+      "ATAC-seq" = "#FF7F00"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Core_Promoter" = "#FF0000",
+      "Active_Chromatin" = "#00FF00",
+      "Active_Enhancer" = "#0000FF"
+    ),
+    name = "Regulatory Region"
+  ) +
+  labs(
+    x = "Distance from TSS (kb)",
+    title = "Epigenetic Landscape of Human MDK Promoter (Merged View)",
+    subtitle = paste("Chr11:", promoter_start, "-", promoter_end, "(GRCh38)"),
+    color = "Epigenetic Mark",
+    fill = "Regulatory Region"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11)
+  ) +
+  annotate(
+    "text",
+    x = 0,
+    y = max(binned_data$mean_signal, na.rm = TRUE) * 1.05,
+    label = "TSS", color = "red", size = 4, fontface = "bold"
+  )
+
+ggsave("MDK_promoter_signals_merged_actual.png", p_merged_actual, width = 14, height = 8, dpi = 300)
+cat("Saved: MDK_promoter_signals_merged_actual.png\n")
