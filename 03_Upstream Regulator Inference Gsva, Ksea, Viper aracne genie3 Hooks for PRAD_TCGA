@@ -1,0 +1,860 @@
+# ============================================================ 
+# COMBINED PIPELINE (GSVA, KSEA via PDC, VIPER/ARACNe/GENIE3 + TCGA PRAD fallback)
+# ============================================================
+# - Load Top/Bottom 250 gene lists from Excel
+# - TF enrichment (Enrichr + ChEA3)
+# - Pathways (FGSEA: Hallmarks/Reactome/KEGG; PROGENy scores)
+# - GSVA (needs expression matrix; falls back to TCGA PRAD if none supplied)
+# - KSEA (needs phospho; auto-fetches CPTAC-PRAD phospho via PDC GraphQL if none supplied)
+# - Regulators (VIPER using ARACNe or inferred GENIE3 regulon; DoRothEA fallback)
+# - Signature reversal: L1000FWD (opposite) → per-drug summary
+# - Drug–target mapping: Open Targets GraphQL
+# - Cross-evidence ranking
+# - One Excel report
+# ============================================================
+
+suppressPackageStartupMessages({
+  base_pkgs <- c(
+    "readxl","dplyr","purrr","stringr","tidyr","httr","jsonlite",
+    "openxlsx","AnnotationDbi","org.Hs.eg.db","scales","tibble",
+    "msigdbr","fgsea"
+  )
+  for (p in base_pkgs) if (!requireNamespace(p, quietly = TRUE))
+    install.packages(p, repos = "https://cloud.r-project.org")
+  lapply(base_pkgs, library, character.only = TRUE)
+
+  # --- Optional: PROGENy ---
+  has_progeny <- FALSE
+  if (!requireNamespace("progeny", quietly = TRUE)) {
+    try({
+      if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install("progeny", update = FALSE, ask = FALSE)
+    }, silent = TRUE)
+  }
+  has_progeny <<- requireNamespace("progeny", quietly = TRUE)
+  if (has_progeny) suppressPackageStartupMessages(library(progeny))
+
+  # --- Optional: Enrichr ---
+  if (!requireNamespace("enrichR", quietly = TRUE)) {
+    try(install.packages("enrichR", repos = "https://cloud.r-project.org"), silent = TRUE)
+  }
+  if (requireNamespace("enrichR", quietly = TRUE)) library(enrichR)
+
+  # --- GSVA / VIPER / GRN / KSEA / matrices ---
+  add_pkgs <- c(
+    "GSVA","GSEABase","Matrix",       # GSVA
+    "dorothea","viper",               # VIPER
+    "GENIE3","igraph",                # GRN
+    "KSEAapp",                        # KSEA
+    "doRNG","foreach","doParallel"    # parallel deps for GENIE3
+  )
+  for (p in add_pkgs) if (!requireNamespace(p, quietly = TRUE)) {
+    if (p %in% c("viper","GENIE3","dorothea","GSVA","GSEABase")) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install(p, update = FALSE, ask = FALSE)
+    } else {
+      install.packages(p, repos = "https://cloud.r-project.org")
+    }
+  }
+  library(GSVA); library(GSEABase); library(Matrix)
+  library(dorothea); library(viper); library(GENIE3); library(igraph)
+  library(KSEAapp); library(doRNG); library(foreach); library(doParallel)
+
+  # --- cBioPortalData (TCGA PRAD fallback) ---
+  cbio_pkgs <- c("cBioPortalData","SummarizedExperiment","edgeR")
+  for (p in cbio_pkgs) if (!requireNamespace(p, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(p, update = FALSE, ask = FALSE)
+  }
+  library(cBioPortalData); library(SummarizedExperiment); library(edgeR)
+})
+
+`%||%` <- function(a,b) if (!is.null(a)) a else b
+
+# ---------------- Config ----------------
+infile_excel <- "/Users/cj719/cBio_prad_tcga_TNFSF12_MDK_top_bottom_250.xlsx"
+sheet_up     <- "Shared_Top250"
+sheet_down   <- "Shared_Bottom250"
+gene_col     <- "gene"      # column containing gene symbols
+
+# Targets for drug mapping (Open Targets)
+map_targets  <- c("TNFSF12","MDK")
+
+# L1000 settings
+L1000_BASES  <- c("https://maayanlab.cloud/l1000fwd/","https://amp.pharm.mssm.edu/l1000fwd/")
+l1000_topn   <- 200
+
+# Enrichr DBs
+tf_dbs <- c("ChEA_2022","ENCODE_TF_ChIP-seq_2015",
+            "TRRUST_Transcription_Factors_2019","ARCHS4_TFs_Coexpression")
+
+# Open Targets GraphQL endpoint
+OT_GQL <- "https://api.platform.opentargets.org/api/v4/graphql"
+
+# Expression / VIPER options
+expr_file           <- NA_character_   # set a path to override auto PRAD fetch
+expr_is_log         <- TRUE            # FALSE if counts
+sample_groups_csv   <- NA_character_   # optional CSV with columns: sample,group (2 groups)
+aracne_network_file <- NA_character_   # optional ARACNe adjacency (TF\tTarget\tWeight)
+
+# KSEA options
+phospho_file        <- NA_character_   # optional local phospho table (GeneSymbol, Site, Value)
+
+# Output
+outfile_xlsx <- "TNFSF12_MDK_COMBINED_Upstream_and_Drugs.xlsx"
+
+# ---------------- Small helpers ----------------
+clean_gene <- function(x) toupper(stringr::str_squish(as.character(x)))
+clean_drug <- function(x){
+  x <- toupper(as.character(x))
+  x <- gsub("[^A-Z0-9]+"," ",x)
+  stringr::str_squish(x)
+}
+pull_genes <- function(df, col){
+  nms <- names(df); idx <- which(tolower(nms) == tolower(col))
+  if (!length(idx)) stop("Column '", col, "' not found in sheet.")
+  g <- clean_gene(df[[idx]]); g <- g[!is.na(g) & nzchar(g)]
+  unique(g)
+}
+to_ensembl <- function(syms){
+  syms <- unique(clean_gene(syms))
+  res <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = syms, keytype = "SYMBOL",
+                               column = "ENSEMBL", multiVals = "first")
+  tibble(symbol = names(res), ensembl = unname(res)) %>% dplyr::filter(!is.na(ensembl))
+}
+
+# Excel sheet naming (<=31 chars, unique)
+.used_sheets <- character(0)
+safe_sheet <- function(s){ s <- gsub("[\\[\\]\\*\\?/:]", "_", s); substr(s,1,31) }
+add_ws <- function(wb, nm){
+  nm <- safe_sheet(nm); base <- nm; i <- 1
+  while (nm %in% .used_sheets) { nm <- safe_sheet(paste0(base, "_", i)); i <- i + 1 }
+  openxlsx::addWorksheet(wb, nm); .used_sheets <<- c(.used_sheets, nm); nm
+}
+
+# ---------------- Enrichr (optional) ----------------
+run_enrichr_safe <- function(genes, dbs, list_label){
+  if (!requireNamespace("enrichR", quietly = TRUE) || length(genes) == 0) return(NULL)
+  tryCatch({
+    enrichR::setEnrichrSite("Enrichr")
+    res_list <- enrichR::enrichr(genes, dbs)
+    dplyr::bind_rows(lapply(names(res_list), function(nm){
+      tb <- res_list[[nm]]; if (is.null(tb) || !nrow(tb)) return(NULL)
+      tibble::as_tibble(tb) %>% dplyr::mutate(Database = nm, list_type = list_label)
+    }))
+  }, error = function(e){ message("Enrichr error: ", e$message); NULL })
+}
+
+# ---------------- ChEA3 (API) ----------------
+chea3_query <- function(genes, list_name = "query"){
+  if (!length(genes)) return(NULL)
+  url <- "https://maayanlab.cloud/chea3/api/enrich/"
+  payload <- list(query_name = list_name, gene_set = as.character(genes))
+  res <- try(httr::POST(url, body = jsonlite::toJSON(payload, auto_unbox = TRUE),
+                        encode = "json", httr::timeout(60)), silent = TRUE)
+  if (inherits(res,"try-error") || httr::status_code(res) != 200) return(NULL)
+  js <- httr::content(res, as = "parsed", type = "application/json", encoding = "UTF-8")
+  out <- list()
+  for (nm in names(js)) {
+    tb <- try(tibble::as_tibble(js[[nm]], .name_repair = "unique"), silent = TRUE)
+    if (!inherits(tb,"try-error") && nrow(tb) > 0) { tb$source <- nm; out[[length(out)+1]] <- tb }
+  }
+  if (length(out) == 0) NULL else dplyr::bind_rows(out)
+}
+
+# ---------------- L1000FWD (signature reversal) ----------------
+l1000_sig_search <- function(up, down){
+  payload <- list(up_genes = up, down_genes = down)
+  for (base in L1000_BASES) {
+    resp <- try(httr::RETRY("POST", paste0(base, "sig_search"),
+                            body = payload, encode = "json",
+                            times = 3, pause_min = 1,
+                            terminate_on = c(400,401,403,404),
+                            httr::timeout(60)), silent = TRUE)
+    if (!inherits(resp, "try-error") && httr::status_code(resp) == 200) {
+      js <- jsonlite::fromJSON(httr::content(resp, "text", encoding = "UTF-8"))
+      rid <- js$result_id %||% NA_character_
+      if (!is.na(rid)) return(list(result_id = rid, base = base))
+    }
+  }
+  list(result_id = NA_character_, base = NA_character_)
+}
+l1000_fetch_topn <- function(base, result_id){
+  if (is.na(result_id) || !nzchar(base)) return(NULL)
+  resp <- try(httr::RETRY("GET", paste0(base, "result/topn/", result_id),
+                          times = 3, pause_min = 1, httr::timeout(60)), silent = TRUE)
+  if (inherits(resp, "try-error") || httr::status_code(resp) != 200) return(NULL)
+  jsonlite::fromJSON(httr::content(resp, "text", encoding = "UTF-8"))
+}
+l1000_fetch_sig <- function(base, sig_id){
+  resp <- try(httr::RETRY("GET", paste0(base, "sig/", URLencode(sig_id, reserved = TRUE)),
+                          times = 3, pause_min = 0.5, httr::timeout(60)), silent = TRUE)
+  if (inherits(resp, "try-error") || httr::status_code(resp) != 200) {
+    return(tibble::tibble(sig_id=sig_id, drug_name=NA_character_, pert_id=NA_character_,
+                          cell_id=NA_character_, pert_time=NA_real_, pert_dose=NA_real_))
+  }
+  txt <- httr::content(resp, "text", encoding = "UTF-8")
+  txt <- gsub("NaN", "null", txt, fixed = TRUE)
+  txt <- gsub("Infinity", "null", txt, fixed = TRUE)
+  txt <- gsub("-Infinity", "null", txt, fixed = TRUE)
+  js  <- try(jsonlite::fromJSON(txt), silent = TRUE)
+  if (inherits(js,"try-error")) {
+    return(tibble::tibble(sig_id=sig_id, drug_name=NA_character_, pert_id=NA_character_,
+                          cell_id=NA_character_, pert_time=NA_real_, pert_dose=NA_real_))
+  }
+  tibble::tibble(
+    sig_id    = sig_id,
+    drug_name = js$pert_desc %||% NA_character_,
+    pert_id   = js$pert_id %||% NA_character_,
+    cell_id   = js$cell_id %||% NA_character_,
+    pert_time = js$pert_time %||% NA_real_,
+    pert_dose = js$pert_dose %||% NA_real_
+  )
+}
+
+# ---------------- Open Targets (GraphQL) ----------------
+OT_GQL_query <- function(ensembl_id, page_size = 500L){
+  if (is.na(ensembl_id) || !nzchar(ensembl_id)) return(tibble())
+  query <- '
+  query targetDrugAssociations($ensemblId: String!, $size: Int!) {
+    target(ensemblId: $ensemblId) {
+      id approvedSymbol
+      knownDrugs(page: {index: 0, size: $size}) {
+        uniqueDrugs
+        rows {
+          drugId prefName actionType mechanismOfAction phase status
+          disease { id name }
+          drug { id name }
+          targets { id approvedSymbol }
+        }
+      }
+    }
+  }'
+  resp <- try(httr::POST(OT_GQL, body = list(
+    query = query, variables = list(ensemblId = ensembl_id, size = as.integer(page_size))
+  ), encode = "json", httr::timeout(60)), silent = TRUE)
+  if (inherits(resp,"try-error") || httr::status_code(resp) != 200) return(tibble())
+  js <- jsonlite::fromJSON(httr::content(resp,"text",encoding="UTF-8"), simplifyVector = FALSE)
+  rows <- js$data$target$knownDrugs$rows
+  if (!length(rows)) return(tibble())
+  purrr::map_dfr(rows, function(r){
+    tibble::tibble(
+      target_ensembl = ensembl_id,
+      target_symbol  = js$data$target$approvedSymbol %||% NA_character_,
+      drug_id        = r$drugId %||% NA_character_,
+      drug_name      = r$prefName %||% (r$drug$name %||% NA_character_),
+      action_type    = r$actionType %||% NA_character_,
+      moa            = r$mechanismOfAction %||% NA_character_,
+      phase          = r$phase %||% NA_integer_,
+      status         = r$status %||% NA_character_,
+      disease_id     = r$disease$id %||% NA_character_,
+      disease_name   = r$disease$name %||% NA_character_,
+      drug_clean     = clean_drug(r$prefName %||% (r$drug$name %||% NA_character_))
+    )
+  }) %>% dplyr::distinct()
+}
+normalize_ot <- function(df){
+  if (is.null(df) || !nrow(df)) {
+    return(tibble::tibble(
+      drug_clean    = character(),
+      target_symbol = character(),
+      phase         = integer()
+    ))
+  }
+  need <- c("drug_name","drug_clean","target_symbol","phase")
+  for (cc in setdiff(need, names(df))) df[[cc]] <- NA
+  if (!"drug_clean" %in% names(df) || all(is.na(df$drug_clean))) {
+    base_str <- df$drug_name; base_str[is.na(base_str)] <- ""
+    df$drug_clean <- base::toupper(stringr::str_squish(gsub("[^A-Za-z0-9]+"," ", base_str)))
+  } else {
+    df$drug_clean <- base::toupper(stringr::str_squish(gsub("[^A-Za-z0-9]+"," ", df$drug_clean)))
+  }
+  df
+}
+
+# ---------------- Pathways (FGSEA + PROGENy) ----------------
+build_signed_ranks <- function(up, down) {
+  up   <- unique(toupper(up));   up   <- up[!is.na(up) & nzchar(up)]
+  down <- unique(toupper(down)); down <- down[!is.na(down) & nzchar(down)]
+  genes <- unique(c(up, down)); genes <- genes[!is.na(genes) & nzchar(genes)]
+  if (!length(genes)) return(numeric(0))
+  stats <- rep(0, length(genes)); names(stats) <- genes
+  stats[intersect(genes, up)]   <-  1
+  stats[intersect(genes, down)] <- -1
+  bad <- is.na(names(stats)) | names(stats)=="" | is.na(stats)
+  if (any(bad)) stats <- stats[!bad]
+  stats
+}
+run_fgsea_sets <- function(stats, category = "H", subcat = NULL, minSize = 10, maxSize = 500) {
+  if (is.null(stats) || !length(stats)) return(NULL)
+  bad <- is.na(names(stats)) | names(stats)=="" | is.na(stats)
+  if (any(bad)) stats <- stats[!bad]
+  if (!length(stats)) return(NULL)
+
+  use_collection <- "collection" %in% names(formals(msigdbr::msigdbr))
+  args <- list(species = "Homo sapiens")
+  if (use_collection) {
+    args$collection <- category
+    if (!is.null(subcat)) args$subcategory <- subcat
+  } else {
+    args$category <- category
+    if (!is.null(subcat)) args$subcategory <- subcat
+  }
+  msig <- try(do.call(msigdbr::msigdbr, args), silent = TRUE)
+  if (inherits(msig, "try-error") || is.null(msig) || !nrow(msig)) return(NULL)
+
+  gsets <- split(toupper(msig$gene_symbol), msig$gs_name)
+  gsets <- lapply(gsets, function(g) intersect(names(stats), g))
+  keep  <- lengths(gsets) >= minSize & lengths(gsets) <= maxSize
+  gsets <- gsets[keep]
+  if (!length(gsets)) return(NULL)
+
+  suppressWarnings({
+    fg <- fgsea::fgsea(pathways = gsets, stats = stats, eps = 1e-6, minSize = minSize, maxSize = maxSize)
+  })
+  if (is.null(fg) || !nrow(fg)) return(NULL)
+
+  dplyr::as_tibble(fg) %>%
+    dplyr::arrange(dplyr::desc(abs(.data$NES))) %>%
+    dplyr::mutate(collection = paste0(category, if (!is.null(subcat)) paste0("_", subcat) else ""))
+}
+run_progeny_signed <- function(stats_signed, top = 500) {
+  if (!has_progeny) return(NULL)
+  expr <- matrix(stats_signed, ncol = 1)
+  rownames(expr) <- names(stats_signed); colnames(expr) <- "pseudo"
+  sc <- try(progeny::progeny(t(expr), scale = FALSE, top = top, organism = "Human"), silent = TRUE)
+  if (inherits(sc, "try-error") || is.null(sc)) return(NULL)
+  tibble::tibble(pathway = rownames(sc), score = as.numeric(sc[, 1])) %>%
+    dplyr::arrange(dplyr::desc(abs(.data$score)))
+}
+safe_rescale <- function(x, from) {
+  if (length(from) != 2 || any(!is.finite(from)) || diff(from) == 0) return(rep(0, length(x)))
+  scales::rescale(x, to = c(0, 1), from = from)
+}
+
+# ---------------- Expression I/O helpers ----------------
+.read_expr <- function(path){
+  if (is.na(path) || !nzchar(path) || !file.exists(path)) return(NULL)
+  message("Loading expression from ", path)
+  ext <- tolower(tools::file_ext(path))
+  if (ext == "rds") {
+    m <- readRDS(path)
+  } else if (ext %in% c("csv","tsv","txt")) {
+    sep <- if (ext == "csv") "," else "\t"
+    m <- read.delim(path, sep = sep, check.names = FALSE, row.names = 1, stringsAsFactors = FALSE)
+    m <- as.matrix(m)
+  } else {
+    stop("Unsupported expr file extension: ", ext)
+  }
+  storage.mode(m) <- "double"
+  m <- m[rowSums(is.na(m)) < ncol(m), , drop = FALSE]
+  if (any(duplicated(rownames(m)))) m <- m[!duplicated(rownames(m)), , drop = FALSE]
+  m
+}
+.norm_expr <- function(m, is_log){
+  if (is.null(m)) return(NULL)
+  if (isTRUE(is_log)) return(m)
+  if (!requireNamespace("edgeR", quietly = TRUE)) install.packages("edgeR", repos = "https://cloud.r-project.org")
+  suppressPackageStartupMessages(library(edgeR))
+  dge <- DGEList(counts = m)
+  dge <- calcNormFactors(dge)
+  logCPM <- cpm(dge, log = TRUE, prior.count = 1)
+  as.matrix(logCPM)
+}
+
+# ---------------- TCGA PRAD fallback loader ----------------
+.tcga_export_csv <- "TCGA_PRAD_expr_filtered.csv"
+load_tcga_prad_expr <- function(){
+  cbio <- cBioPortal()
+  prad <- cBioDataPack("prad_tcga", ask = FALSE)
+  if (!"mrna_seq_v2_rsem" %in% names(experiments(prad))){
+    stop("Assay 'mrna_seq_v2_rsem' not found in PRAD TCGA; available: ", paste(names(experiments(prad)), collapse=","))
+  }
+  expr <- assays(experiments(prad)[["mrna_seq_v2_rsem"]])[[1]]
+  expr_cpm  <- edgeR::cpm(expr, log = FALSE)
+  expr_log2 <- log2(expr_cpm + 1)
+  keep <- rowSums(expr_cpm > 1) >= (0.2 * ncol(expr_cpm))
+  expr_filt <- expr_log2[keep, , drop = FALSE]
+  utils::write.csv(as.data.frame(expr_filt), .tcga_export_csv)
+  message("TCGA PRAD expression loaded & filtered → ", normalizePath(.tcga_export_csv))
+  expr_filt
+}
+
+# ---------------- CPTAC/PDC phospho (PRAD) for KSEA ----------------
+.pdc_endpoint <- "https://pdc.cancer.gov/graphql"
+pdc_gql <- function(query, variables = NULL){
+  payload <- list(query = query); if (!is.null(variables)) payload$variables <- variables
+  resp <- httr::POST(.pdc_endpoint, body = jsonlite::toJSON(payload, auto_unbox = TRUE),
+                     encode = "json", httr::add_headers(`Content-Type` = "application/json"))
+  httr::stop_for_status(resp)
+  out <- jsonlite::fromJSON(httr::content(resp, "text", encoding = "UTF-8"), simplifyVector = FALSE)
+  if (!is.null(out$errors)) stop("PDC GraphQL error: ", paste(vapply(out$errors, function(e) e$message, ""), collapse = "; "))
+  out$data
+}
+.pdc_find_prad_studies <- function(){
+  q <- "query($program: String!, $disease: String!){ studies(program_name: $program, disease_type: $disease){ pdc_study_id study_name analytical_fraction experiment_type } }"
+  dat <- pdc_gql(q, list(program = "CPTAC", disease = "Prostate Adenocarcinoma"))
+  tibble::as_tibble(dat$studies)
+}
+.pdc_list_phospho_files <- function(pdc_study_id){
+  q <- "query($sid: String!){ files(pdc_study_id: $sid, data_category: \"Proteome\", data_type: \"Phosphoproteome\"){ file_id file_name md5sum file_size unit data_category data_type file_format download_url } }"
+  dat <- pdc_gql(q, list(sid = pdc_study_id))
+  tibble::as_tibble(dat$files)
+}
+.choose_matrix_file <- function(files_df){
+  if (is.null(files_df) || !nrow(files_df)) return(NULL)
+  cand <- files_df; nm <- tolower(cand$file_name)
+  score <- as.numeric(grepl("matrix|aggregat|phospho|site|quant|level", nm))
+  if ("file_format" %in% names(cand)) score <- score + ifelse(grepl("tsv|txt", tolower(cand$file_format)), 1, 0)
+  cand$.__score <- score
+  cand[order(-cand$.__score), ][1, , drop = FALSE]
+}
+.pdc_download_file <- function(url, outdir = tempdir()){
+  if (is.null(url) || is.na(url) || !nzchar(url)) stop("No download_url exposed by PDC for this file.")
+  fn <- basename(url); dest <- file.path(outdir, fn)
+  utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+  dest
+}
+.read_phospho_matrix <- function(path){
+  first_line <- readLines(path, n = 1)
+  delim <- if (grepl("\t", first_line)) "\t" else ","
+  df <- tryCatch({ read.delim(path, sep = delim, check.names = FALSE, stringsAsFactors = FALSE) },
+                 error = function(e){ read.csv(path, check.names = FALSE, stringsAsFactors = FALSE) })
+  df
+}
+.extract_gene_site <- function(df){
+  nms <- tolower(names(df))
+  gene_col <- dplyr::first(c(
+    names(df)[grepl("^gene$|gene.symbol|hgnc|protein$|uniprot", nms)],
+    names(df)[1]
+  ))
+  site_col <- dplyr::first(c(
+    names(df)[grepl("site|modsite|position|phospho|residue", nms)],
+    NA
+  ))
+  gene <- df[[gene_col]]
+  site <- if (!is.na(site_col)) df[[site_col]] else NA
+  if (all(is.na(site))){
+    tmp <- as.character(gene)
+    site <- sub(".*[_| ]([STY][0-9]+)$", "\\1", tmp)
+    gene <- sub("^([A-Za-z0-9.-]+)[_| ].*$", "\\1", tmp)
+  }
+  tibble::tibble(GeneSymbol = as.character(gene), Site = toupper(as.character(site)))
+}
+make_ksea_from_matrix <- function(mat_df, sample_meta = NULL){
+  anno_cols <- which(sapply(mat_df, function(x) !is.numeric(x))); if (length(anno_cols) == 0) anno_cols <- 1L
+  expr <- as.matrix(mat_df[, -anno_cols, drop = FALSE]); storage.mode(expr) <- "double"
+  id_df <- .extract_gene_site(mat_df)
+  groups <- NULL
+  if (!is.null(sample_meta) && all(c("sample","group") %in% names(sample_meta))){
+    mi <- match(colnames(expr), sample_meta$sample); groups <- sample_meta$group[mi]
+  }
+  val <- NULL
+  if (!is.null(groups) && length(unique(na.omit(groups))) == 2){
+    glev <- unique(na.omit(groups)); g1 <- which(groups == glev[1]); g2 <- which(groups == glev[2])
+    tstat <- apply(expr, 1, function(v){
+      x <- v[g1]; y <- v[g2]
+      if (length(x) < 2 || length(y) < 2) return(NA_real_)
+      ts <- try(stats::t.test(x, y)$statistic, silent = TRUE)
+      as.numeric(if (inherits(ts, "try-error")) NA_real_ else ts)
+    })
+    val <- as.numeric(tstat)
+  } else {
+    val <- as.numeric(scale(rowMeans(expr, na.rm = TRUE)))
+  }
+  out <- dplyr::bind_cols(id_df, Value = val)
+  out <- out[!is.na(out$Value) & nzchar(out$GeneSymbol) & grepl("^[STY][0-9]+$", out$Site), ]
+  out
+}
+fetch_PRAD_phospho_KSEA <- function(){
+  studies <- .pdc_find_prad_studies()
+  if (!nrow(studies)) stop("No CPTAC PRAD studies found via PDC.")
+  sid <- studies$pdc_study_id[1]
+  files <- .pdc_list_phospho_files(sid)
+  if (!nrow(files)) stop("No phosphoproteome files found for study ", sid)
+  mf <- .choose_matrix_file(files)
+  message("Downloading ", mf$file_name, " …")
+  loc <- .pdc_download_file(mf$download_url)
+  mat <- .read_phospho_matrix(loc)
+  ksea_input <- make_ksea_from_matrix(mat)
+  KSEA_scores <<- tryCatch({ KSEAapp::KSEA.Complete(ksea_input) }, error = function(e){ message("KSEA error: ", e$message); NULL })
+  invisible(list(studies = studies, chosen_file = mf, ksea = KSEA_scores))
+}
+
+# =========================
+# 1) Load Top/Bottom 250
+# =========================
+stopifnot(file.exists(infile_excel))
+up_df   <- readxl::read_excel(infile_excel, sheet = sheet_up)
+down_df <- readxl::read_excel(infile_excel, sheet = sheet_down)
+up_genes   <- pull_genes(up_df,   gene_col)
+down_genes <- pull_genes(down_df, gene_col)
+message("Loaded: ", length(up_genes), " up; ", length(down_genes), " down.")
+
+# =========================
+# 2) TF enrichment
+# =========================
+enr_up     <- run_enrichr_safe(up_genes,   tf_dbs, "UP")
+enr_down   <- run_enrichr_safe(down_genes, tf_dbs, "DOWN")
+chea3_up   <- chea3_query(up_genes,   "UP")
+chea3_down <- chea3_query(down_genes, "DOWN")
+
+# =========================
+# 3) Pathways
+# =========================
+stats_signed   <- build_signed_ranks(up_genes, down_genes)
+fgsea_hallmark <- run_fgsea_sets(stats_signed, category="H")
+fgsea_reactome <- run_fgsea_sets(stats_signed, category="C2", subcat="REACTOME")
+fgsea_kegg     <- run_fgsea_sets(stats_signed, category="C2", subcat="CP:KEGG")
+progeny_scores <- run_progeny_signed(stats_signed, top=500)
+
+# =========================
+# 4) L1000FWD reversal
+# =========================
+sig_info <- l1000_sig_search(up_genes, down_genes)
+topn     <- l1000_fetch_topn(sig_info$base, sig_info$result_id)
+
+opposite_tbl <- similar_tbl <- NULL
+if (!is.null(topn)) {
+  if (!is.null(topn$opposite) && length(topn$opposite) > 0) {
+    opp_tmp <- tibble::as_tibble(topn$opposite) %>%
+      dplyr::transmute(list_type="opposite", sig_id=as.character(.data$sig_id), score=as.numeric(.data$scores)) %>%
+      dplyr::arrange(.data$score)   # more negative = stronger reversal
+    opposite_tbl <- head(opp_tmp, l1000_topn)
+  }
+  if (!is.null(topn$similar) && length(topn$similar) > 0) {
+    similar_tbl <- tibble::as_tibble(topn$similar) %>%
+      dplyr::transmute(list_type="similar", sig_id=as.character(.data$sig_id), score=as.numeric(.data$scores))
+  }
+}
+
+opposite_sig_annot <- NULL
+if (!is.null(opposite_tbl) && nrow(opposite_tbl) > 0 && nzchar(sig_info$base)) {
+  message("Resolving ", nrow(opposite_tbl), " opposite signatures via ", sig_info$base, " ...")
+  opposite_sig_annot <- purrr::map_dfr(opposite_tbl$sig_id, function(sid){
+    out <- l1000_fetch_sig(sig_info$base, sid); Sys.sleep(0.05); out
+  }) %>% dplyr::distinct(.data$sig_id, .keep_all = TRUE)
+}
+
+l1000_opposite_signatures <- l1000_opposite_drugs <- NULL
+if (!is.null(opposite_tbl) && !is.null(opposite_sig_annot)) {
+  l1000_opposite_signatures <- dplyr::inner_join(opposite_tbl, opposite_sig_annot, by="sig_id") %>%
+    dplyr::mutate(
+      is_confidential = is.na(.data$drug_name) | .data$drug_name == "-666" | !nzchar(.data$drug_name),
+      drug_label = dplyr::if_else(.data$is_confidential,
+                                  paste0(dplyr::coalesce(.data$pert_id, .data$sig_id, "UNKNOWN"), " (CONFIDENTIAL)"),
+                                  .data$drug_name),
+      drug_clean = dplyr::if_else(.data$is_confidential,
+                                  clean_drug(dplyr::coalesce(.data$pert_id, .data$sig_id, "UNKNOWN")),
+                                  clean_drug(.data$drug_name))
+    ) %>%
+    dplyr::filter(!is.na(.data$drug_clean), nzchar(.data$drug_clean))
+
+  l1000_opposite_drugs <- l1000_opposite_signatures %>%
+    dplyr::group_by(.data$drug_clean) %>%
+    dplyr::summarise(
+      drug_display     = dplyr::first(stats::na.omit(.data$drug_label)),
+      any_confidential = any(.data$is_confidential, na.rm=TRUE),
+      n_signatures     = dplyr::n(),
+      cells            = paste(sort(unique(stats::na.omit(.data$cell_id))), collapse="; "),
+      min_score        = min(.data$score, na.rm=TRUE),
+      mean_score       = mean(.data$score, na.rm=TRUE),
+      median_score     = median(.data$score, na.rm=TRUE),
+      doses            = paste(sort(unique(stats::na.omit(.data$pert_dose))), collapse="; "),
+      times_h          = paste(sort(unique(stats::na.omit(.data$pert_time))), collapse="; "),
+      .groups          = "drop"
+    ) %>%
+    dplyr::arrange(.data$min_score) %>%
+    dplyr::mutate(reversal_strength = -.data$min_score)
+}
+
+# =========================
+# 5) Open Targets + Cross-evidence
+# =========================
+ens_tbl  <- to_ensembl(map_targets)
+ot_drugs <- dplyr::bind_rows(purrr::map(ens_tbl$ensembl, OT_GQL_query)) %>% dplyr::distinct() %>% normalize_ot()
+
+cross_evidence <- NULL
+if (!is.null(l1000_opposite_drugs) && nrow(l1000_opposite_drugs) > 0) {
+  tgt_summary <- ot_drugs %>%
+    dplyr::group_by(.data$drug_clean) %>%
+    dplyr::summarise(
+      hits_targets = paste(sort(unique(stats::na.omit(.data$target_symbol))), collapse="; "),
+      n_targets    = dplyr::n_distinct(stats::na.omit(.data$target_symbol)),
+      any_phase    = suppressWarnings(max(.data$phase %||% 0, na.rm=TRUE)),
+      .groups      = "drop"
+    )
+  rng_rev <- range(l1000_opposite_drugs$reversal_strength, na.rm=TRUE)
+  rng_tar <- if (nrow(tgt_summary)) c(0, max(tgt_summary$n_targets, na.rm=TRUE)) else c(0,0)
+  rng_phs <- if (nrow(tgt_summary)) c(0, max(tgt_summary$any_phase, na.rm=TRUE)) else c(0,0)
+
+  cross_evidence <- l1000_opposite_drugs %>%
+    dplyr::left_join(tgt_summary, by="drug_clean") %>%
+    dplyr::mutate(
+      n_targets = tidyr::replace_na(.data$n_targets, 0L),
+      any_phase = tidyr::replace_na(.data$any_phase, 0L),
+      rank_score =
+        safe_rescale(.data$reversal_strength, rng_rev) +
+        0.30 * safe_rescale(.data$n_targets, rng_tar) +
+        0.20 * safe_rescale(.data$any_phase, rng_phs)
+    ) %>%
+    dplyr::arrange(dplyr::desc(.data$rank_score))
+}
+
+# =========================
+# 6) Expression (file or TCGA PRAD fallback) → for GSVA / VIPER
+# =========================
+expr_log <- NULL
+if (is.na(expr_file) || !nzchar(expr_file)) expr_log <- try(load_tcga_prad_expr(), silent = TRUE)
+if (inherits(expr_log, "try-error") || is.null(expr_log)) {
+  expr_raw <- .read_expr(expr_file)
+  expr_log <- .norm_expr(expr_raw, is_log = expr_is_log)
+}
+expr_filt <- expr_log
+
+# =========================
+# 7) GSVA (Hallmarks)
+# =========================
+GSVA_Hallmarks <- NULL
+if (!is.null(expr_filt) && nrow(expr_filt) > 0) {
+  msig_h <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H")
+  gsets  <- split(toupper(msig_h$gene_symbol), msig_h$gs_name)
+  expr_gsva <- as.matrix(expr_filt)
+  expr_gsva <- expr_gsva[!duplicated(rownames(expr_gsva)), , drop = FALSE]
+  rownames(expr_gsva) <- toupper(rownames(expr_gsva))
+  if (anyNA(expr_gsva)) {
+    expr_gsva <- t(apply(expr_gsva, 1, function(v){ if(all(is.na(v))) rep(NA_real_, length(v)) else { v[is.na(v)] <- mean(v, na.rm=TRUE); v } }))
+    expr_gsva <- expr_gsva[rowSums(is.na(expr_gsva))==0, , drop=FALSE]
+  }
+  gsets <- lapply(gsets, function(g) intersect(g, rownames(expr_gsva)))
+  gsets <- gsets[lengths(gsets) >= 10]
+  if (nrow(expr_gsva) > 0 && length(gsets)) {
+    gsc <- try(GSEABase::GeneSetCollection(
+      mapply(function(genes, nm) GSEABase::GeneSet(setName = nm, geneIds = as.character(genes)),
+             gsets, names(gsets), SIMPLIFY = FALSE)
+    ), silent = TRUE)
+
+    attempts <- list(
+      function(){ GSVA::gsva(exprData = expr_gsva, geneSets = gsc, kcdf = "Gaussian", verbose = FALSE) },
+      function(){ GSVA::gsva(geneSets = gsc, exprData = expr_gsva, kcdf = "Gaussian", verbose = FALSE) },
+      function(){ GSVA::gsva(expr = expr_gsva, gset.idx.list = gsets, method = "gsva", kcdf = "Gaussian", parallel.sz = 1, verbose = FALSE) },
+      function(){ GSVA::gsva(expr = expr_gsva, gset.idx.list = gsets, method = "ssgsea", kcdf = "Gaussian", parallel.sz = 1, verbose = FALSE) }
+    )
+    gsva_mat <- NULL
+    for (fn in attempts) {
+      res <- try(fn(), silent = TRUE)
+      if (!inherits(res, "try-error")) { gsva_mat <- res; break }
+    }
+    if (is.null(gsva_mat)) {
+      z <- t(scale(t(expr_gsva))); z[!is.finite(z)] <- 0
+      sc <- lapply(gsets, function(g){ if (length(g)==0) return(rep(NA_real_, ncol(z))); colMeans(z[g, , drop=FALSE], na.rm = TRUE) })
+      gsva_mat <- do.call(rbind, sc); rownames(gsva_mat) <- names(gsets); colnames(gsva_mat) <- colnames(expr_gsva)
+    }
+    GSVA_Hallmarks <- as.data.frame(gsva_mat) %>% tibble::rownames_to_column("geneset")
+  }
+}
+# =========================
+# 8) Regulators: VIPER/ARACNe/GENIE3  (FAST)
+# =========================
+VIPER_activity <- VIPER_diff <- NULL
+if (!is.null(expr_log) && nrow(expr_log) > 0) {
+  get_dorothea_regulon <- function(levels = c("A","B","C")){
+    dorothea_hs <- dorothea::dorothea_hs
+    dorothea_hs %>% dplyr::filter(confidence %in% levels) %>% dorothea::df2regulon()
+  }
+  regulon_from_aracne <- function(file){
+    if (is.na(file) || !nzchar(file) || !file.exists(file)) return(NULL)
+    adj <- read.delim(file, header = FALSE, stringsAsFactors = FALSE)
+    colnames(adj)[1:3] <- c("tf","target","weight")
+    split(adj, adj$tf) |> lapply(function(df){
+      list(tfmode = setNames(rep(1, nrow(df)), df$target), likelihood = setNames(df$weight, df$target))
+    })
+  }
+
+  # --- Speed-optimized GENIE3 wrapper ---
+  regulon_from_genie3 <- function(expr_log,
+                                  regulators = NULL,
+                                  keep_top   = 5000,   # fewer edges returned
+                                  max_genes  = 3000,   # stronger prefilter
+                                  nTrees     = 200,    # fewer trees
+                                  nCores     = NULL,
+                                  tf_only    = TRUE,
+                                  fallback_if_big = TRUE,
+                                  big_threshold   = 4000){
+    if (is.null(expr_log)) return(NULL)
+
+    # Early fallback if too large
+    if (fallback_if_big && nrow(expr_log) > big_threshold) {
+      message("GENIE3 skipped (matrix too large: ", nrow(expr_log), " genes). Using DoRothEA fallback.")
+      return(NULL)
+    }
+
+    m <- as.matrix(expr_log); storage.mode(m) <- "double"
+    m <- m[rowSums(is.na(m)) < ncol(m), , drop = FALSE]
+    rn <- rownames(m); if (is.null(rn)) stop("Expression matrix must have rownames for GENIE3.")
+
+    # Collapse duplicated gene IDs by mean
+    if (anyDuplicated(rn)) {
+      message("GENIE3: collapsing duplicated gene IDs by mean (", sum(duplicated(rn)), " duplicates).")
+      summed <- rowsum(m, group = rn, reorder = FALSE, na.rm = TRUE)
+      counts <- as.numeric(table(rn)[rownames(summed)]); m <- summed / pmax(counts, 1)
+    }
+
+    # Clean remaining non-finite
+    m[!is.finite(m)] <- NA_real_
+    m <- m[rowSums(is.na(m)) < ncol(m), , drop = FALSE]
+
+    # Regulators: TF-only, intersect with matrix
+    regs <- regulators
+    if (is.null(regs) && isTRUE(tf_only) && requireNamespace("dorothea", quietly = TRUE)) {
+      regs <- base::unique(dorothea::dorothea_hs$tf)
+    }
+    if (!is.null(regs)) {
+      regs <- intersect(regs, rownames(m))
+      if (!length(regs)) regs <- NULL
+    }
+
+    # Strong variance prefilter (keep most variable genes; always keep regulators)
+    if (!is.null(max_genes) && is.finite(max_genes) && nrow(m) > max_genes) {
+      vars <- tryCatch({
+        if (requireNamespace("matrixStats", quietly = TRUE)) matrixStats::rowVars(m, na.rm = TRUE)
+        else apply(m, 1, stats::var, na.rm = TRUE)
+      }, error = function(e) apply(m, 1, stats::var, na.rm = TRUE))
+      ord <- order(vars, decreasing = TRUE)
+      keep_idx <- ord[seq_len(max_genes)]
+      keep_genes <- rownames(m)[keep_idx]
+      if (!is.null(regs)) keep_genes <- base::unique(c(keep_genes, regs))
+      m <- m[keep_genes, , drop = FALSE]
+    }
+
+    # Cap cores to avoid overhead
+    if (is.null(nCores)) {
+      dc <- try(parallel::detectCores(logical = FALSE), silent = TRUE)
+      if (inherits(dc, "try-error") || is.na(dc)) dc <- 1L
+      nCores <- max(1L, min(4L, as.integer(dc) - 1L))
+    }
+    if (nCores > 1L && !requireNamespace("doRNG", quietly = TRUE)) {
+      message("Package 'doRNG' not found; running GENIE3 with nCores=1."); nCores <- 1L
+    }
+
+    nTrees <- as.integer(nTrees)
+    message(sprintf("GENIE3 (fast): %d genes (%s regulators); nTrees=%d; nCores=%d",
+                    nrow(m), ifelse(is.null(regs), "no", as.character(length(regs))), nTrees, nCores))
+
+    set.seed(1)
+    w <- GENIE3::GENIE3(m, regulators = regs, nTrees = nTrees, nCores = nCores)
+    links <- GENIE3::getLinkList(w)
+    if (!nrow(links)) return(NULL)
+    links <- links[order(links$weight, decreasing = TRUE), , drop = FALSE]
+    if (!is.null(keep_top) && nrow(links) > keep_top) links <- links[seq_len(keep_top), , drop = FALSE]
+
+    split(links, links$regulatoryGene) |> lapply(function(df){
+      list(
+        tfmode = setNames(rep(1, nrow(df)), df$targetGene),
+        likelihood = setNames(df$weight, df$targetGene)
+      )
+    })
+  }
+
+  # ---------- Build regulon (ARACNe > fast GENIE3 > DoRothEA) ----------
+  regulon <- NULL
+  if (!is.na(aracne_network_file) && file.exists(aracne_network_file)) {
+    regulon <- regulon_from_aracne(aracne_network_file)
+  }
+  if (is.null(regulon) || !length(regulon)) {
+    message("Building GENIE3 regulon (fast settings)…")
+    regulon <- regulon_from_genie3(expr_log)
+  }
+  if (is.null(regulon) || !length(regulon)) {
+    message("Falling back to DoRothEA regulon levels A–C…")
+    regulon <- get_dorothea_regulon(levels = c("A","B","C"))
+  }
+
+  # ---------- VIPER activity / differential ----------
+  vp <- viper::viper(eset = expr_log, regulon = regulon, verbose = FALSE)
+  if (!is.null(vp)) VIPER_activity <- as.data.frame(vp) %>% tibble::rownames_to_column("TF")
+
+  if (!is.na(sample_groups_csv) && file.exists(sample_groups_csv)) {
+    gg <- read.csv(sample_groups_csv, stringsAsFactors = FALSE)
+    stopifnot(all(c("sample","group") %in% names(gg)))
+    match_idx <- match(colnames(expr_log), gg$sample); groups <- gg$group[match_idx]
+    keep <- !is.na(groups)
+    if (sum(keep) >= 4 && length(base::unique(groups[keep])) == 2) {
+      sig <- viper::rowTtest(expr_log[, keep, drop = FALSE], groups[keep])[,"statistic"]
+      names(sig) <- rownames(expr_log)
+      mrs <- viper::msviper(sig, regulon, verbose = FALSE)
+      res <- viper::summary(mrs)$es$nes
+      VIPER_diff <- tibble::tibble(
+        tf = names(res), NES = as.numeric(res),
+        group_contrast = paste(base::unique(groups[keep])[1], "vs", base::unique(groups[keep])[2])
+      )
+    }
+  }
+}
+# =========================
+# 9) KSEA (local file or PDC auto-fetch)
+# =========================
+KSEA_scores <- NULL
+if (!is.na(phospho_file) && file.exists(phospho_file)) {
+  phospho_df <- read.delim(phospho_file, sep = ifelse(grepl("\\.csv$", phospho_file, ignore.case = TRUE), ",", "\t"), stringsAsFactors = FALSE)
+  if (!all(c("GeneSymbol","Site","Value") %in% names(phospho_df))) {
+    nms <- names(phospho_df)
+    names(phospho_df)[match(nms[1:3], nms)] <- c("GeneSymbol","Site","Value")[seq_along(nms[1:3])]
+  }
+  KSEA_scores <- tryCatch({ KSEAapp::KSEA.Complete(phospho_df) }, error = function(e){ message("KSEA error: ", e$message); NULL })
+} else {
+  message("No local phospho file; attempting CPTAC/PDC PRAD fetch for KSEA…")
+  try(fetch_PRAD_phospho_KSEA(), silent = TRUE)
+}
+
+# =========================
+# 10) Write Excel
+# =========================
+wb <- openxlsx::createWorkbook()
+
+sn <- add_ws(wb, "INPUT_up");   openxlsx::writeData(wb, sn, tibble::tibble(gene = up_genes))
+sn <- add_ws(wb, "INPUT_down"); openxlsx::writeData(wb, sn, tibble::tibble(gene = down_genes))
+
+if (!is.null(enr_up))     { sn <- add_ws(wb, "Enrichr_UP");       openxlsx::writeData(wb, sn, enr_up) }
+if (!is.null(enr_down))   { sn <- add_ws(wb, "Enrichr_DOWN");     openxlsx::writeData(wb, sn, enr_down) }
+if (!is.null(chea3_up))   { sn <- add_ws(wb, "ChEA3_UP");         openxlsx::writeData(wb, sn, chea3_up) }
+if (!is.null(chea3_down)) { sn <- add_ws(wb, "ChEA3_DOWN");       openxlsx::writeData(wb, sn, chea3_down) }
+
+if (!is.null(fgsea_hallmark)) { sn <- add_ws(wb, "FGSEA_Hallmarks"); openxlsx::writeData(wb, sn, fgsea_hallmark) }
+if (!is.null(fgsea_reactome)) { sn <- add_ws(wb, "FGSEA_Reactome");  openxlsx::writeData(wb, sn, fgsea_reactome) }
+if (!is.null(fgsea_kegg))     { sn <- add_ws(wb, "FGSEA_KEGG");      openxlsx::writeData(wb, sn, fgsea_kegg) }
+if (!is.null(progeny_scores)) { sn <- add_ws(wb, "PROGENy_scores");  openxlsx::writeData(wb, sn, progeny_scores) }
+
+if (!is.null(GSVA_Hallmarks)) { sn <- add_ws(wb, "GSVA_Hallmarks");  openxlsx::writeData(wb, sn, GSVA_Hallmarks) }
+if (!is.null(VIPER_activity)) { sn <- add_ws(wb, "VIPER_activity");  openxlsx::writeData(wb, sn, VIPER_activity) }
+if (!is.null(VIPER_diff))     { sn <- add_ws(wb, "VIPER_msviper");   openxlsx::writeData(wb, sn, VIPER_diff) }
+
+if (!is.null(KSEA_scores))    { sn <- add_ws(wb, "KSEA_scores");     openxlsx::writeData(wb, sn, KSEA_scores) }
+
+if (!is.null(opposite_tbl))               { sn <- add_ws(wb, "L1000_opposite_raw");  openxlsx::writeData(wb, sn, opposite_tbl) }
+if (!is.null(similar_tbl) && nrow(similar_tbl)) { sn <- add_ws(wb, "L1000_similar_raw");   openxlsx::writeData(wb, sn, similar_tbl) }
+if (!is.null(l1000_opposite_signatures))  { sn <- add_ws(wb, "L1000_opposite_sigs"); openxlsx::writeData(wb, sn, l1000_opposite_signatures) }
+if (!is.null(l1000_opposite_drugs))       { sn <- add_ws(wb, "L1000_opposite_drugs");openxlsx::writeData(wb, sn, l1000_opposite_drugs) }
+
+if (nrow(ot_drugs))         { sn <- add_ws(wb, "OpenTargets_drugs"); openxlsx::writeData(wb, sn, ot_drugs) }
+if (!is.null(cross_evidence)){ sn <- add_ws(wb, "CrossEvidence");     openxlsx::writeData(wb, sn, cross_evidence) }
+
+sn <- add_ws(wb, "README")
+notes <- data.frame(Note = c(
+  paste0("Source Excel: ", infile_excel, " | Sheets: ", sheet_up, " (up), ", sheet_down, " (down) | Column: ", gene_col),
+  "Enrichr DBs: ChEA_2022, ENCODE TF ChIP-seq 2015, TRRUST 2019, ARCHS4 TFs.",
+  "ChEA3 queried via API; tables include multiple reference sources.",
+  "FGSEA: Hallmarks/Reactome/KEGG on signed +/- ranks; PROGENy pathway activity from same.",
+  "GSVA: Hallmark enrichment per sample; robust intersection/size filters applied.",
+  "VIPER: ARACNe (if provided) > GENIE3 (inferred) > DoRothEA fallback.",
+  "KSEA: local phospho or auto CPTAC-PRAD via PDC GraphQL.",
+  "L1000FWD: opposite signatures (more negative scores = stronger reversal).",
+  "Confidential L1000 drug names (-666) labeled by BRD pert_id and grouped by pert_id.",
+  "Open Targets: known drugs for TNFSF12/MDK (SYMBOL→ENSEMBL via org.Hs.eg.db).",
+  "Cross-evidence rank = reversal strength + target overlap + clinical phase (heuristic).",
+  "APIs require internet; tabs can be empty if a service is unreachable."
+))
+openxlsx::writeData(wb, sn, notes)
+
+openxlsx::saveWorkbook(wb, outfile_xlsx, overwrite = TRUE)
+cat("Done. Wrote: ", normalizePath(outfile_xlsx), "\n")
