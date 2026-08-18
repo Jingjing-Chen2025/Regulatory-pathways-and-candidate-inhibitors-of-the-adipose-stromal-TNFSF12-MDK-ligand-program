@@ -1,0 +1,113 @@
+library(dplyr)
+library(readr)
+library(stringr)
+
+# --- Inputs ---
+file_path <- "/Volumes/Jingjing Chen/ProteomeXchange PXD042859/Phospho (STY)Sites.txt"
+if (!file.exists(file_path)) stop("File not found: ", file_path)
+stysites <- read_delim(file_path, delim = "	", guess_max = 1e6)
+
+# Define your sample columns (auto-detect; edit if you want explicit groups)
+all_cols <- names(stysites)
+
+# Prefer MaxQuant columns like: "Intensity .10A", "Intensity .10B", "Intensity .10C"
+# Fallback to plain "Intensity" / "Intensity___<n>" if those are absent.
+int_dot   <- grep("^Intensity \\.[0-9]+[A-C]$", all_cols, value = TRUE)  # fixed regex
+int_plain <- grep("^Intensity(___[0-9]+)?$", all_cols, value = TRUE)
+
+if (length(int_dot)) {
+  intensity_cols <- int_dot
+  # Grouping by suffix: A vs B (C often a bridge/reference; excluded from stats by default)
+  grpA_cols   <- grep("^Intensity \\.[0-9]+A$", intensity_cols, value = TRUE)  # fixed regex
+  grpB_cols   <- grep("^Intensity \\.[0-9]+B$", intensity_cols, value = TRUE)  # fixed regex
+  bridge_cols <- grep("^Intensity \\.[0-9]+C$", intensity_cols, value = TRUE)  # fixed regex
+  # Fallback if one group is empty: split first six columns into 3/3
+  if (!length(grpA_cols) || !length(grpB_cols)) {
+    first6    <- head(intensity_cols, 6)
+    grpA_cols <- head(first6, floor(length(first6)/2))
+    grpB_cols <- setdiff(first6, grpA_cols)
+  }
+} else if (length(int_plain)) {
+  intensity_cols <- int_plain
+  first6    <- head(intensity_cols, 6)
+  grpA_cols <- head(first6, floor(length(first6)/2))
+  grpB_cols <- setdiff(first6, grpA_cols)
+} else {
+  stop("No intensity columns found (expected 'Intensity .<plex><A/B/C>' or 'Intensity', 'Intensity___n').")
+}
+
+# --- Clean & filter ---
+
+# Map expected columns (robust to MaxQuant header variants); fall back gracefully if absent
+col_or_null <- function(opts){
+  nm <- intersect(opts, names(stysites)); if (length(nm)) nm[1] else NULL
+}
+col_or_stop <- function(opts){
+  nm <- intersect(opts, names(stysites)); if (length(nm)) nm[1] else stop("Missing expected column(s): ", paste(opts, collapse=", "))
+}
+
+localprob_col <- col_or_stop(c("Localization prob","Localization Prob","Localization probability"))
+reverse_col    <- col_or_null(c("Reverse"))
+contam_col     <- col_or_null(c("Potential contaminant","Potential Contaminant"))
+
+# These may be missing in some exports; handle via fallback
+gn_col         <- col_or_null(c("Gene names","Gene Names","Gene.names","GeneNames"))
+prot_col       <- col_or_null(c("Protein","Leading proteins","Leading Proteins","Proteins"))
+pos_col        <- col_or_stop(c("Positions within proteins","Positions within protein"))
+aa_col         <- col_or_stop(c("Amino acid","Amino Acid"))
+seqwin_col     <- col_or_null(c("Sequence window","Sequence Window"))
+
+clean <- stysites %>%
+  filter(.data[[localprob_col]] >= 0.75) %>%
+  { if (!is.null(reverse_col)) filter(., is.na(.data[[reverse_col]]) | .data[[reverse_col]] != "+") else . } %>%
+  { if (!is.null(contam_col)) filter(., is.na(.data[[contam_col]]) | .data[[contam_col]] != "+") else . } %>%
+  mutate(
+    Gene = if (!is.null(gn_col)) {
+      vapply(stringr::str_split(.data[[gn_col]], ";"), `[`, 1, FUN.VALUE = character(1))
+    } else if ("Fasta headers" %in% names(.)) {
+      # Parse GN= symbol from FASTA header if available
+      sub(".*GN=([^ ]+).*", "\\1", .data[["Fasta headers"]], perl = TRUE)
+
+    } else {
+      NA_character_
+    },
+    Protein = if (!is.null(prot_col)) {
+      vapply(stringr::str_split(.data[[prot_col]], ";"), `[`, 1, FUN.VALUE = character(1))
+    } else {
+      NA_character_
+    },
+    Position = vapply(stringr::str_split(.data[[pos_col]], ";"), `[`, 1, FUN.VALUE = character(1)),
+    Residue.Both = paste0(.data[[aa_col]], Position),
+    `Sequence window` = if (!is.null(seqwin_col)) .data[[seqwin_col]] else NA_character_
+  )
+
+# log2 transform (add small offset if needed)
+log2A <- log2(as.matrix(clean[, grpA_cols, drop=FALSE] + 1))
+log2B <- log2(as.matrix(clean[, grpB_cols, drop=FALSE] + 1))
+
+# Means & FC
+mA <- rowMeans(log2A, na.rm = TRUE)
+mB <- rowMeans(log2B, na.rm = TRUE)
+log2FC <- mA - mB
+
+# Simple p-values per site (Welch t-test)
+pvals <- sapply(seq_len(nrow(clean)), function(i){
+  x <- as.numeric(log2A[i,]); y <- as.numeric(log2B[i,])
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  if(length(x) >= 2 && length(y) >= 2){
+    tryCatch(t.test(x, y)$p.value, error=function(e) NA_real_)
+  } else NA_real_
+})
+
+# Build KSEA table
+ksea <- clean %>%
+  transmute(
+    Protein = Protein,
+    Gene = Gene,
+    Peptide = `Sequence window`,        # or join to evidence.txt for Modified sequence
+    Residue.Both = Residue.Both,
+    FC = log2FC,
+    p = pvals
+  )
+
+write_csv(ksea, "KSEA_phospho_file.csv")
