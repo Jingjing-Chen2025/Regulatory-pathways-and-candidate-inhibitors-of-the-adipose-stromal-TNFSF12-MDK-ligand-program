@@ -1,0 +1,57 @@
+# =========================
+# Load libraries
+# =========================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(ggplot2)
+  library(forcats)
+})
+
+# =========================
+# File & sheet
+# =========================
+file_path <- "/Users/cj719/cBio_prad_tcga_TNFSF12_MDK_COMBINED_Upstream_and_Drugs.xlsx"
+sheet_name <- "FGSEA_Hallmarks"
+
+# =========================
+# Read data
+# =========================
+df <- read_excel(file_path, sheet = sheet_name) %>%
+  as.data.frame()
+
+# Check required columns
+req_cols <- c("pathway", "padj", "NES", "size", "leadingEdge")
+missing <- setdiff(req_cols, names(df))
+if (length(missing) > 0) {
+  stop("Missing columns in FGSEA_Hallmarks: ", paste(missing, collapse = ", "))
+}
+
+# =========================
+# Prepare data
+# =========================
+df <- df %>%
+  mutate(
+    pathway = fct_reorder(pathway, NES),   # reorder pathways by NES
+    log10padj = -log10(padj)               # transform p-values for color scale if desired
+  )
+
+# =========================
+# Plot — Lollipop plot
+# =========================
+ggplot(df, aes(x = NES, y = pathway)) +
+  geom_segment(aes(x = 0, xend = NES, y = pathway, yend = pathway), color = "grey80") +
+  geom_point(aes(size = size, color = log10padj)) +
+  scale_color_gradient(low = "blue", high = "red", name = "-log10(padj)") +
+  scale_size(range = c(2, 8), name = "Gene set size") +
+  labs(
+    title = "FGSEA Hallmarks",
+    x = "Normalized Enrichment Score (NES)",
+    y = "Pathway"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 12)
+  )
+
