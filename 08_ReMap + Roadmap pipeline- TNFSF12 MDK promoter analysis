@@ -1,0 +1,553 @@
+############################################################
+# ReMap + Roadmap pipeline: TNFSF12 / MDK promoter analysis
+#
+# Current configuration:
+# - Uses local ReMap 2022 non-redundant MACS2 peaks (hg38) to find TF binding
+#   File: /Volumes/Jingjing Chen/remap2022_nr_macs2_hg38_v1_0.bed.gz
+# - Uses local Roadmap histone mark tagAligns as chromatin accessibility proxies:
+#   marks = c("H3K27ac","H3K4me3","H3K4me1")
+#   cell types: adipose_sub (E063), adipose_vis (E065), admsc (E025), fibro (E055)
+#   Directory: /Volumes/Jingjing Chen/Roadmap
+#
+# Notes:
+# - org.Hs.eg.db package name is case-sensitive (lowercase 'org').
+# - Falls back to AnnotationHub OrgDb if org.Hs.eg.db is unavailable.
+# - Section 6 builds a GRangesList then unlists before reduce().
+############################################################
+
+############################
+# 0) Package Installation  #
+############################
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# Restore Bioconductor repos if overridden
+bioc_repos <- BiocManager::repositories()
+current_repos <- getOption("repos")
+if (!all(names(bioc_repos) %in% names(current_repos))) {
+  options(repos = bioc_repos)
+}
+
+required_pkgs <- c(
+  "BiocFileCache",
+  "rtracklayer",
+  "GenomicRanges",
+  "TxDb.Hsapiens.UCSC.hg38.knownGene",
+  "org.Hs.eg.db",
+  "AnnotationDbi",
+  "rappdirs",
+  "curl"
+)
+
+to_install <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install)) {
+  message("Installing missing Bioconductor/CRAN packages: ", paste(to_install, collapse = ", "))
+  BiocManager::install(to_install, ask = FALSE, update = FALSE)
+}
+
+suppressPackageStartupMessages({
+  library(BiocFileCache)
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  have_org <- requireNamespace("org.Hs.eg.db", quietly = TRUE)
+  library(AnnotationDbi)
+  library(rappdirs)
+})
+
+############################
+# 1) User Inputs           #
+############################
+
+tf_list <- c(
+  "HEYL","GLI2","GLI1","HIC1","TWIST2","TWIST1","MITF","EBF1","GATA2",
+  "FOXL1","FOXC2","FOXF1","EGR2","ESR1","NR2F1","ATF5","FOS","WT1",
+  "EGR1","AR","SNAI2","JUN","ETV1","RARG","FOSL1","MYC","JUNB",
+  "HAND2","SNAI1","EPAS1","PHOX2A","MSC"
+)
+
+genes_of_interest <- c("TNFSF12","MDK")
+
+# ReMap peaks: prefer local override
+remap_hg38_meta_url <- ""  # leave blank since we use a local file
+remap_local_override <- "/Volumes/Jingjing Chen/remap2022_nr_macs2_hg38_v1_0.bed.gz"
+
+# Remote candidates (kept for completeness; not used when local override is valid)
+candidate_remap_urls <- c(
+  "https://remap.univ-amu.fr/storage/remap2022/hg38/MACS2/remap2022_nr_macs2_hg38_v1_0.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2024/hg38/remap2024_TF_all_meta_clusters.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2024/hg38/remap2024_allTFs_meta_clusters.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2024/hg38/remap2024_meta_clusters_allTFs.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2024/hg38/remap2024_all_macs2_meta_clusters.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2022/hg38/remap2022_TF_all_meta_clusters.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2022/hg38/remap2022_allTFs_meta_clusters.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2022/hg38/remap2022_meta_clusters_allTFs.bed.gz",
+  "https://remap.univ-amu.fr/storage/remap2022/hg38/remap2022_all_macs2_meta_clusters.bed.gz"
+)
+
+# Local Roadmap tagAlign base and marks to use as accessibility proxies
+local_tagalign_base <- "/Volumes/Jingjing Chen/Roadmap"
+histone_marks <- c("H3K27ac","H3K4me3","H3K4me1")
+
+# Build local file paths per cell type (EIDs)
+tagalign_files <- list(
+  adipose_sub = file.path(local_tagalign_base, paste0("E063-", histone_marks, ".tagAlign.gz")),
+  adipose_vis = file.path(local_tagalign_base, paste0("E065-", histone_marks, ".tagAlign.gz")),
+  admsc       = file.path(local_tagalign_base, paste0("E025-", histone_marks, ".tagAlign.gz")),
+  fibro       = file.path(local_tagalign_base, paste0("E055-", histone_marks, ".tagAlign.gz"))
+)
+
+# Minimum read overlaps threshold to call promoter "accessible" for a given cell type
+min_reads <- 10
+
+############################
+# 2) Helper Functions      #
+############################
+
+bf <- BiocFileCache(rappdirs::user_cache_dir("remap_roadmap_cache"), ask = FALSE)
+
+verify_url_status <- function(url) {
+  # Quick existence check (used only when downloading remote files)
+  tmp <- tempfile()
+  ok <- TRUE
+  status <- NA_integer_
+  tryCatch({
+    curl::curl_download(url, tmp, quiet = TRUE, mode = "wb")
+    status <- 200L
+  }, error = function(e) ok <<- FALSE)
+  unlink(tmp)
+  if (!ok) status <- NA_integer_
+  status
+}
+
+safe_download <- function(url, min_size = 50000L, label = "resource") {
+  status <- verify_url_status(url)
+  if (!is.na(status) && status != 200L) {
+    message("URL not accessible (status ", status, "): ", url)
+    return(NA_character_)
+  }
+  local <- NA_character_
+  # Try BiocFileCache first
+  try({
+    local <- bfcrpath(bf, url)
+  }, silent = TRUE)
+  if (is.na(local) || !file.exists(local)) {
+    # Fallback manual download
+    local <- file.path(rappdirs::user_cache_dir("remap_roadmap_cache"), basename(url))
+    dir.create(dirname(local), recursive = TRUE, showWarnings = FALSE)
+    dl_ok <- FALSE
+    try({
+      curl::curl_download(url, local, mode = "wb")
+      dl_ok <- TRUE
+    }, silent = TRUE)
+    if (!dl_ok) {
+      try({
+        download.file(url, local, mode = "wb", quiet = TRUE)
+        dl_ok <- TRUE
+      }, silent = TRUE)
+    }
+    if (!dl_ok || !file.exists(local)) {
+      message("Download failed for: ", url)
+      return(NA_character_)
+    }
+  }
+  sz <- suppressWarnings(file.info(local)$size)
+  if (is.na(sz) || sz < min_size) {
+    message("Downloaded ", label, " seems too small (", sz, " bytes): ", url)
+    return(NA_character_)
+  }
+  local
+}
+
+list_dir_links <- function(dir_url) {
+  out <- character(0)
+  tmp <- tempfile()
+  ok <- TRUE
+  txt <- NULL
+  tryCatch({
+    curl::curl_download(dir_url, tmp, mode = "wb", quiet = TRUE)
+    txt <- readLines(tmp, warn = FALSE)
+  }, error = function(e) ok <<- FALSE, finally = if (file.exists(tmp)) unlink(tmp))
+  if (!ok || is.null(txt)) return(out)
+  hrefs <- unique(gsub('.*href=["\']([^"\']+)["\'].*', '\\1', grep("href=", txt, value = TRUE)))
+  hrefs <- hrefs[grepl("\\.bed\\.gz$", hrefs)]
+  hrefs <- ifelse(grepl("^https?://", hrefs), hrefs, paste0(sub("/+$", "", dir_url), "/", gsub("^\\./", "", hrefs)))
+  unique(hrefs)
+}
+
+resolve_remap_url <- function(primary_url, candidates, local_override = "") {
+  # 0) local override
+  if (nzchar(local_override)) {
+    if (!file.exists(local_override)) {
+      stop("Local override path does not exist: ", local_override)
+    }
+    message("Using local ReMap file: ", normalizePath(local_override))
+    return(normalizePath(local_override))
+  }
+  # 1) explicit URL
+  if (nzchar(primary_url)) {
+    loc <- safe_download(primary_url, label = "ReMap peaks")
+    if (!is.na(loc)) return(loc) else message("Primary ReMap URL failed: ", primary_url)
+  }
+  # 2) candidate list (not expected to be used in this configuration)
+  for (u in candidates) {
+    message("Trying candidate: ", u)
+    loc <- safe_download(u, label = "ReMap peaks")
+    if (!is.na(loc)) {
+      message("Using candidate ReMap file: ", u)
+      return(loc)
+    }
+  }
+  # 3) optional directory scrape
+  dir_bases <- c(
+    "https://remap.univ-amu.fr/storage/remap2024/hg38/",
+    "https://remap.univ-amu.fr/storage/remap2022/hg38/",
+    "https://remap.univ-amu.fr/storage/remap2022/hg38/MACS2/"
+  )
+  for (base in dir_bases) {
+    message("Attempting directory listing scrape: ", base)
+    links <- list_dir_links(base)
+    if (length(links)) {
+      prio <- links[grepl("\\.bed\\.gz$", links, ignore.case = TRUE)]
+      for (u in prio) {
+        message("Trying discovered file: ", u)
+        loc <- safe_download(u, label = "ReMap peaks")
+        if (!is.na(loc)) {
+          message("Using discovered ReMap file: ", u)
+          return(loc)
+        }
+      }
+    } else {
+      message("No directory listing or no links found at: ", base)
+    }
+  }
+  stop("Unable to download any ReMap peaks file.\nSupply a working URL or set a valid local override path.")
+}
+
+import_bed <- function(path) {
+  gr <- rtracklayer::import(path, format = "BED")
+  seqlevelsStyle(gr) <- "UCSC"
+  gr
+}
+
+# Extract TF name from the 'name' field; compatible with ReMap formats
+extract_tf <- function(x) {
+  nm <- as.character(x)
+  tf <- sub("^.*TF=([^;]+).*$", "\\1", nm)                  # pattern with TF=NAME;
+  tf2 <- ifelse(tf == nm, sub("_meta.*$", "", nm), tf)      # NAME_meta...
+  tf3 <- ifelse(tf2 == nm, sub("\\s.*$", "", tf2), tf2)     # NAME rest...
+  tf3
+}
+
+############################
+# 3) Promoter Definitions  #
+############################
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+if (have_org) {
+  # Exported OrgDb object from org.Hs.eg.db
+  orgdb <- getExportedValue("org.Hs.eg.db", "org.Hs.eg.db")
+} else {
+  warning("org.Hs.eg.db not available; using AnnotationHub fallback.")
+  if (!requireNamespace("AnnotationHub", quietly = TRUE)) {
+    BiocManager::install("AnnotationHub", ask = FALSE, update = FALSE)
+  }
+  ah <- AnnotationHub::AnnotationHub()
+  orgdb <- AnnotationHub::query(ah, c("Homo sapiens", "OrgDb"))[[1]]
+}
+
+entrez <- AnnotationDbi::mapIds(
+  orgdb,
+  keys = genes_of_interest,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+prom_all <- promoters(genes(txdb), upstream = 2000, downstream = 500)
+prom_sel <- prom_all[names(prom_all) %in% entrez]
+
+# Map Entrez IDs back to gene symbols for labeling
+symbol_by_entrez <- setNames(names(entrez), entrez)
+names(prom_sel) <- symbol_by_entrez[names(prom_sel)]
+
+# Merge multiple transcript promoters per gene
+prom_sel <- reduce(split(prom_sel, names(prom_sel)))
+prom_sel <- unlist(prom_sel, use.names = TRUE)
+
+############################
+# 4) ReMap Peaks           #
+############################
+
+remap_local <- resolve_remap_url(remap_hg38_meta_url, candidate_remap_urls, remap_local_override)
+remap_meta <- import_bed(remap_local)
+
+# Ensure TF column present with robust parsing of the 'name' field.
+if (!"TF" %in% colnames(mcols(remap_meta))) {
+  mcols(remap_meta)$TF <- NA_character_
+}
+
+nmcol <- if ("name" %in% colnames(mcols(remap_meta))) "name" else NULL
+if (!is.null(nmcol)) {
+  # Step 1: heuristic extraction
+  tf_guess <- extract_tf(mcols(remap_meta)[[nmcol]])
+  same_as_input <- tf_guess == as.character(mcols(remap_meta)[[nmcol]])
+  tf_guess[same_as_input] <- NA_character_
+  mcols(remap_meta)$TF <- ifelse(is.na(mcols(remap_meta)$TF), tf_guess, mcols(remap_meta)$TF)
+
+  # Step 2: fallback substring detection against your TF list
+  need <- which(is.na(mcols(remap_meta)$TF))
+  if (length(need)) {
+    nm_up <- toupper(as.character(mcols(remap_meta)[[nmcol]])[need])
+    tf_up <- toupper(tf_list)
+    assigned <- rep(NA_character_, length(need))
+    for (i in seq_along(tf_up)) {
+      pat <- paste0("(^|[^A-Z0-9])", tf_up[i], "([^A-Z0-9]|$)")
+      hit <- grepl(pat, nm_up, perl = TRUE)
+      assigned[is.na(assigned) & hit] <- tf_list[i]
+    }
+    tmp <- mcols(remap_meta)$TF
+    tmp[need] <- ifelse(is.na(tmp[need]), assigned, tmp[need])
+    mcols(remap_meta)$TF <- tmp
+  }
+} else {
+  warning("No 'name' column found in ReMap BED; TF assignment will be NA.")
+}
+
+# Filter to the TFs of interest
+remap_meta_sub <- remap_meta[!is.na(remap_meta$TF) & mcols(remap_meta)$TF %in% tf_list]
+
+# Overlap with promoters
+hits_tf_prom <- subsetByOverlaps(remap_meta_sub, prom_sel)
+ov_tf_prom <- findOverlaps(prom_sel, hits_tf_prom)
+
+tf_prom_table <- data.frame(
+  Gene      = names(prom_sel)[queryHits(ov_tf_prom)],
+  TF        = hits_tf_prom$TF[subjectHits(ov_tf_prom)],
+  PeakChr   = as.character(seqnames(hits_tf_prom))[subjectHits(ov_tf_prom)],
+  PeakStart = start(hits_tf_prom)[subjectHits(ov_tf_prom)],
+  PeakEnd   = end(hits_tf_prom)[subjectHits(ov_tf_prom)],
+  stringsAsFactors = FALSE
+)
+tf_prom_table <- unique(tf_prom_table)
+
+############################
+# 5) Histone Mark Accessibility (LOCAL FILES)
+############################
+# For each cell type:
+#  - Load local tagAlign for each selected mark
+#  - Restrict to promoters
+#  - Count read overlaps per promoter
+#  - Call promoter "accessible" if any mark count > min_reads
+
+prom_acc_list <- list()
+prom_acc_df <- list()
+
+for (ct in names(tagalign_files)) {
+  ct_files <- tagalign_files[[ct]]
+  max_counts <- setNames(integer(length(prom_sel)), names(prom_sel))
+  
+  for (fpath in ct_files) {
+    message("Processing ", ct, " mark file: ", fpath)
+    if (!file.exists(fpath)) {
+      warning("Local file not found (skipping): ", fpath)
+      next
+    }
+    tag_gr <- import_bed(fpath)              # tagAlign is BED-like; rtracklayer can import
+    tag_prom <- subsetByOverlaps(tag_gr, prom_sel)
+    if (length(tag_prom) == 0) next
+    counts <- countOverlaps(prom_sel, tag_prom)
+    names(counts) <- names(prom_sel)
+    max_counts <- pmax(max_counts, counts)
+  }
+  
+  accessible_idx <- which(max_counts > min_reads)
+  if (length(accessible_idx)) {
+    accessible_promoters <- prom_sel[accessible_idx]
+    prom_acc_list[[ct]] <- accessible_promoters
+    prom_acc_df[[ct]] <- data.frame(
+      CellType  = ct,
+      Gene      = names(accessible_promoters),
+      PeakChr   = as.character(seqnames(accessible_promoters)),
+      PeakStart = start(accessible_promoters),
+      PeakEnd   = end(accessible_promoters),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    prom_acc_list[[ct]] <- GRanges() # empty
+  }
+}
+
+if (length(prom_acc_df)) {
+  prom_acc_df <- do.call(rbind, prom_acc_df)
+  prom_acc_df <- unique(prom_acc_df)
+} else {
+  prom_acc_df <- NULL
+}
+
+############################
+# 6) TF + Accessibility    #
+############################
+
+accessible_union <- GRanges()
+
+# Keep only non-empty GRanges entries
+non_empty_acc <- prom_acc_list[vapply(prom_acc_list, function(x) length(x) > 0L, logical(1))]
+
+if (length(non_empty_acc)) {
+  # Build a GRangesList then unlist to a single GRanges before reduce()
+  if (length(non_empty_acc) == 1L) {
+    union_gr <- non_empty_acc[[1]]
+  } else {
+    union_gr <- unlist(GenomicRanges::GRangesList(non_empty_acc), use.names = FALSE)
+  }
+  accessible_union <- GenomicRanges::reduce(union_gr)
+}
+
+tf_in_accessible_prom <- if (length(accessible_union)) {
+  subsetByOverlaps(hits_tf_prom, accessible_union)
+} else GRanges()
+
+ov_final <- findOverlaps(prom_sel, tf_in_accessible_prom)
+final_df <- data.frame(
+  Gene = names(prom_sel)[queryHits(ov_final)],
+  TF   = tf_in_accessible_prom$TF[subjectHits(ov_final)],
+  stringsAsFactors = FALSE
+)
+final_df <- unique(final_df)
+
+# Add per cell-type accessibility flags
+if (!is.null(prom_acc_df) && nrow(prom_acc_df) > 0) {
+  prom_acc_df$Accessible <- TRUE
+  ct_flags <- reshape(
+    data = prom_acc_df[, c("Gene","CellType","Accessible")],
+    idvar = "Gene",
+    timevar = "CellType",
+    direction = "wide"
+  )
+  names(ct_flags) <- sub("^Accessible\\.", "", names(ct_flags))
+  final_df <- merge(final_df, ct_flags, by = "Gene", all.x = TRUE)
+}
+
+############################
+# 7) Outputs               #
+############################
+
+message("=== TF overlaps in TNFSF12/MDK promoters (ReMap peaks) ===")
+print(tf_prom_table)
+
+if (!is.null(prom_acc_df)) {
+  message("=== Promoter accessibility (Histone mark tagAlign proxy, local files) ===")
+  print(prom_acc_df)
+} else {
+  message("No promoters met accessibility criteria with provided histone marks.")
+}
+
+message("=== TFs with promoter overlap AND accessibility (any cell type) ===")
+print(final_df)
+
+############################
+# 8) Visualization to PDF  #
+############################
+
+# Install visualization packages if needed (CRAN)
+viz_pkgs <- c("ggplot2", "gridExtra")
+missing_viz <- viz_pkgs[!vapply(viz_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_viz)) {
+  install.packages(missing_viz)
+}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(gridExtra)
+})
+
+# Build accessibility matrix (genes x cell types) from prom_acc_df
+cell_types <- c("adipose_sub", "adipose_vis", "admsc", "fibro")
+acc_df <- data.frame(Gene = genes_of_interest,
+                     adipose_sub = FALSE, adipose_vis = FALSE, admsc = FALSE, fibro = FALSE,
+                     stringsAsFactors = FALSE)
+if (!is.null(prom_acc_df) && nrow(prom_acc_df) > 0) {
+  for (ct in cell_types) {
+    g <- unique(prom_acc_df$Gene[prom_acc_df$CellType == ct])
+    acc_df[match(g, acc_df$Gene, nomatch = 0) > 0, ct] <- TRUE
+  }
+}
+
+# Long format for heatmap
+acc_long <- do.call(rbind, lapply(cell_types, function(ct) {
+  data.frame(Gene = acc_df$Gene, CellType = ct, Accessible = acc_df[[ct]], stringsAsFactors = FALSE)
+}))
+acc_long$CellType <- factor(acc_long$CellType, levels = cell_types)
+acc_long$Gene <- factor(acc_long$Gene, levels = genes_of_interest)
+
+# Plot 1: Accessibility heatmap
+p_access_heat <- ggplot(acc_long, aes(x = CellType, y = Gene, fill = Accessible)) +
+  geom_tile(color = "grey80", size = 0.5) +
+  scale_fill_manual(values = c(`TRUE` = "#1f77b4", `FALSE` = "white")) +
+  labs(title = "Promoter Accessibility (Histone marks proxy)",
+       x = "Cell type", y = "Gene", fill = "Accessible") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+# Plot 2: Count of accessible promoters per cell type
+acc_counts_ct <- data.frame(CellType = cell_types,
+                            Accessible = colSums(acc_df[, cell_types, drop = FALSE]))
+p_access_bar_ct <- ggplot(acc_counts_ct, aes(x = CellType, y = Accessible)) +
+  geom_col(fill = "#2ca02c") +
+  labs(title = "Accessible Promoters per Cell Type", x = "Cell type", y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+# Plot 3: Number of TFs overlapping promoter (ReMap) per gene
+tf_counts <- data.frame(Gene = genes_of_interest, TFs = 0, stringsAsFactors = FALSE)
+if (nrow(tf_prom_table) > 0) {
+  agg <- aggregate(TF ~ Gene, tf_prom_table, function(x) length(unique(x)))
+  tf_counts$TFs[match(agg$Gene, tf_counts$Gene, nomatch = 0) > 0] <- agg$TF
+}
+p_tf_bar <- ggplot(tf_counts, aes(x = Gene, y = TFs)) +
+  geom_col(fill = "#ff7f0e") +
+  labs(title = "TFs with promoter overlaps (ReMap)", x = "Gene", y = "TF count") +
+  theme_minimal(base_size = 12)
+
+# Plot 4: Number of TFs with overlaps in accessible promoters per gene (from final_df)
+tfacc_counts <- data.frame(Gene = genes_of_interest, TFs = 0, stringsAsFactors = FALSE)
+if (nrow(final_df) > 0) {
+  agg2 <- aggregate(TF ~ Gene, final_df, function(x) length(unique(x)))
+  tfacc_counts$TFs[match(agg2$Gene, tfacc_counts$Gene, nomatch = 0) > 0] <- agg2$TF
+}
+p_tfacc_bar <- ggplot(tfacc_counts, aes(x = Gene, y = TFs)) +
+  geom_col(fill = "#9467bd") +
+  labs(title = "TFs with promoter overlaps AND accessibility", x = "Gene", y = "TF count") +
+  theme_minimal(base_size = 12)
+
+# Tables (limit rows for readability)
+tbl1 <- if (nrow(tf_prom_table) > 0) gridExtra::tableGrob(head(tf_prom_table[order(tf_prom_table$Gene, tf_prom_table$TF), ], 30), rows = NULL) else NULL
+tbl2 <- if (!is.null(prom_acc_df) && nrow(prom_acc_df) > 0) gridExtra::tableGrob(head(prom_acc_df[order(prom_acc_df$CellType, prom_acc_df$Gene), ], 30), rows = NULL) else NULL
+tbl3 <- if (nrow(final_df) > 0) gridExtra::tableGrob(head(final_df[order(final_df$Gene, final_df$TF), ], 30), rows = NULL) else NULL
+
+# Write to PDF
+out_pdf <- file.path(getwd(), paste0("remap_roadmap_results_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".pdf"))
+pdf(out_pdf, width = 8.5, height = 11)  # US Letter portrait
+# Page 1: Accessibility heatmap
+print(p_access_heat)
+# Page 2: Accessible promoters per cell type
+print(p_access_bar_ct)
+# Page 3: TF promoter overlaps per gene
+print(p_tf_bar)
+# Page 4: TF overlaps with accessibility per gene
+print(p_tfacc_bar)
+# Page 5+: Tables (if available)
+if (!is.null(tbl1)) grid::grid.newpage(); if (!is.null(tbl1)) grid::grid.draw(tbl1)
+if (!is.null(tbl2)) grid::grid.newpage(); if (!is.null(tbl2)) grid::grid.draw(tbl2)
+if (!is.null(tbl3)) grid::grid.newpage(); if (!is.null(tbl3)) grid::grid.draw(tbl3)
+dev.off()
+
+message("Saved PDF visualizations to: ", out_pdf)
+
+############################################################
+# END OF SCRIPT
+############################################################
