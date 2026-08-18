@@ -1,0 +1,177 @@
+# ============================================================
+# cBioPortal (prad_su2c_2019) → gene-gene correlations
+# Targets: TNFSF12, MDK
+# Outputs: per-gene Top/Bottom 250 + Shared Top/Bottom 250 (mean corr)
+# ============================================================
+
+# ---- 0) Packages & installers ----
+ensure_cran <- function(pkg){
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  if (!requireNamespace(pkg, quietly = TRUE)) stop("Please install package: ", pkg)
+}
+ensure_bioc <- function(pkg){
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager", repos = "https://cloud.r-project.org")
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+  if (!requireNamespace(pkg, quietly = TRUE)) stop("Please install Bioconductor package: ", pkg)
+}
+
+ensure_bioc("cBioPortalData")
+ensure_bioc("MultiAssayExperiment")
+ensure_bioc("SummarizedExperiment")
+ensure_cran("dplyr")
+ensure_cran("tibble")
+ensure_cran("stringr")
+ensure_cran("openxlsx")
+
+suppressPackageStartupMessages({
+  library(cBioPortalData)
+  library(MultiAssayExperiment)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+  library(openxlsx)
+})
+
+`%||%` <- function(a,b) if (!is.null(a)) a else b
+
+# ---- 1) Inputs ----
+study_id    <- "prad_su2c_2019"
+targets     <- c("TNFSF12","MDK")
+topN        <- 250
+corr_method <- "pearson"   # or "spearman"
+xlsx_out    <- paste0("cBio_", study_id, "_TNFSF12_MDK_top_bottom_", topN, ".xlsx")
+
+# ---- 2) Helper: get expression assay as matrix [genes x samples] ----
+pick_expr_assay <- function(mae){
+  anames <- names(experiments(mae))
+  if (length(anames) == 0) stop("No assays found in MultiAssayExperiment for study.")
+  # prefer typical mRNA assay names
+  pref_pat <- "(rna|mrna|rna_seq)"
+  hits <- anames[grepl(pref_pat, tolower(anames))]
+  pick <- if (length(hits)) hits[1] else anames[1]
+
+  se <- experiments(mae)[[pick]]
+  if (!inherits(se, "SummarizedExperiment"))
+    stop("Chosen assay '", pick, "' is not a SummarizedExperiment.")
+
+  # gene symbols
+  rd <- as.data.frame(SummarizedExperiment::rowData(se))
+  cand_cols <- c("Hugo_Symbol","Gene","gene_symbol","GeneSymbol","symbol","SYMBOL")
+  col_used <- cand_cols[cand_cols %in% names(rd)][1]
+  gene_sym <- if (length(col_used)) rd[[col_used]] else rownames(se)
+  if (is.null(gene_sym)) stop("Could not find gene symbols in rowData or rownames.")
+  gene_sym <- toupper(as.character(gene_sym))
+
+  # expression (genes x samples)
+  expr <- as.matrix(SummarizedExperiment::assay(se))
+  storage.mode(expr) <- "double"
+
+  # clean & collapse duplicates by mean
+  keep <- !is.na(gene_sym) & nzchar(gene_sym)
+  expr <- expr[keep, , drop = FALSE]
+  gene_sym <- gene_sym[keep]
+
+  if (any(duplicated(gene_sym))) {
+    counts   <- table(gene_sym)
+    expr_sum <- rowsum(expr, group = gene_sym, reorder = FALSE)
+    expr     <- sweep(expr_sum, 1, as.numeric(counts[rownames(expr_sum)]), "/")
+    expr     <- as.matrix(expr)
+    rownames(expr) <- rownames(expr_sum)
+  } else {
+    rownames(expr) <- gene_sym
+  }
+
+  list(expr = expr, assay_name = pick)
+}
+
+# ---- 3) Helper: rank top/bottom correlations for one target gene ----
+rank_one_gene <- function(expr, target_gene, topN = 250, method = "pearson"){
+  tg <- toupper(target_gene)
+  if (!(tg %in% rownames(expr))) stop("Target gene not in expression matrix: ", tg)
+  y <- as.numeric(expr[tg, ])
+  # cor(columns, y): need samples x genes → transpose
+  cvec <- suppressWarnings(stats::cor(t(expr), y, use = "pairwise.complete.obs", method = method))
+  cvec[rownames(expr) == tg] <- NA_real_
+  df <- tibble(gene = rownames(expr), corr = as.numeric(cvec))
+  list(
+    top    = df %>% filter(!is.na(corr)) %>% arrange(desc(corr), gene) %>% slice_head(n = topN),
+    bottom = df %>% filter(!is.na(corr)) %>% arrange(corr, gene)        %>% slice_head(n = topN),
+    all    = df
+  )
+}
+
+# ---- 4) Fetch data & compute ----
+message("Fetching cBioPortal data pack: ", study_id)
+mae <- cBioPortalData::cBioDataPack(study_id)  # cached after first run
+
+expr_info  <- pick_expr_assay(mae)
+expr       <- expr_info$expr
+assay_name <- expr_info$assay_name
+message("Using assay: ", assay_name, " | genes: ", nrow(expr), " | samples: ", ncol(expr))
+
+# Check targets present
+targets_up <- toupper(targets)
+missing <- setdiff(targets_up, rownames(expr))
+if (length(missing) > 0) stop("Missing target genes in expression: ", paste(missing, collapse = ", "))
+
+# ---- 5) Per-gene rankings ----
+res_tables <- list()
+per_target_top <- list()
+per_target_bottom <- list()
+
+for (tg in targets_up) {
+  message("Computing correlations for ", tg, " ...")
+  ranks <- rank_one_gene(expr, tg, topN = topN, method = corr_method)
+  res_tables[[tg]]        <- ranks$all %>% dplyr::rename(!!paste0("corr_", tg) := corr)
+  per_target_top[[tg]]    <- ranks$top
+  per_target_bottom[[tg]] <- ranks$bottom
+}
+
+# ---- 6) Shared (mean correlation across target set) ----
+merged <- Reduce(function(x,y) dplyr::full_join(x, y, by = "gene"), res_tables)
+corr_cols <- grep("^corr_", names(merged), value = TRUE)
+shared <- merged %>%
+  dplyr::mutate(mean_corr = rowMeans(dplyr::across(all_of(corr_cols)), na.rm = TRUE)) %>%
+  dplyr::filter(!(toupper(gene) %in% targets_up))
+
+shared_top    <- shared %>% dplyr::arrange(dplyr::desc(mean_corr), gene) %>% dplyr::slice_head(n = topN)
+shared_bottom <- shared %>% dplyr::arrange(mean_corr, gene)                %>% dplyr::slice_head(n = topN)
+
+# ---- 7) Write Excel (safe sheet names) ----
+.used_sheets <- character(0)
+add_ws <- function(wb, proposed){
+  nm <- gsub("[\\\\/?*\\[\\]:]", "_", proposed); nm <- substr(nm, 1, 31)
+  base <- nm; i <- 1
+  while (nm %in% .used_sheets) { nm <- substr(paste0(base, "_", i), 1, 31); i <- i + 1 }
+  openxlsx::addWorksheet(wb, nm); .used_sheets <<- c(.used_sheets, nm); nm
+}
+
+wb <- createWorkbook()
+
+# Per-target sheets
+for (tg in targets_up) {
+  sn <- add_ws(wb, paste0(tg, "_Top", topN));    writeData(wb, sn, per_target_top[[tg]])
+  sn <- add_ws(wb, paste0(tg, "_Bottom", topN)); writeData(wb, sn, per_target_bottom[[tg]])
+}
+
+# Shared sheets
+sn <- add_ws(wb, paste0("Shared_Top", topN));    writeData(wb, sn, shared_top)
+sn <- add_ws(wb, paste0("Shared_Bottom", topN)); writeData(wb, sn, shared_bottom)
+
+# README / provenance
+sn <- add_ws(wb, "README")
+notes <- tibble::tibble(
+  Key   = c("Study", "Assay", "Targets", "Top/Bottom N", "Method", "Genes", "Samples"),
+  Value = c(study_id, assay_name, paste(targets_up, collapse = ", "),
+            as.character(topN), corr_method, nrow(expr), ncol(expr))
+)
+writeData(wb, sn, notes)
+
+saveWorkbook(wb, xlsx_out, overwrite = TRUE)
+cat("Done. Wrote: ", normalizePath(xlsx_out), "\n")
