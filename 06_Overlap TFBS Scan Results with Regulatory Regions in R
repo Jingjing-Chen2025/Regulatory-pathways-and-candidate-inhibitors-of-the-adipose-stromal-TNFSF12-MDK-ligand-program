@@ -1,0 +1,82 @@
+# ----------------------------------------------------------
+# Overlap TFBS Scan Results with Regulatory Regions in R
+# ----------------------------------------------------------
+
+# 0. Install & load required packages
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+pkgs <- c("openxlsx", "GenomicRanges", "IRanges")
+for (pkg in pkgs) {
+  if (!requireNamespace(pkg, quietly=TRUE)) {
+    if (pkg %in% c("GenomicRanges", "IRanges")) {
+      BiocManager::install(pkg, ask=FALSE, update=FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  library(pkg, character.only=TRUE)
+}
+
+# 1. Read in the TFBS scan results
+tfbs_scan_path <- "/Users/cj719/MDK_promoter_TFBS_scan.xlsx"
+tfbs_df        <- read.xlsx(tfbs_scan_path, sheet = 1)
+required_tfbs_cols <- c("TF", "start_genomic", "end_genomic")
+if (!all(required_tfbs_cols %in% colnames(tfbs_df))) {
+  stop("TFBS scan file must contain columns: ", paste(required_tfbs_cols, collapse=", "))
+}
+
+# 2. Read in the regulatory regions file
+reg_path  <- "/Users/cj719/MDK_promoter_regulatory_regions.xlsx"
+reg_df    <- read.xlsx(reg_path, sheet = 1)
+required_reg_cols <- c("type", "start", "end")
+if (!all(required_reg_cols %in% colnames(reg_df))) {
+  stop("Regulatory regions file must contain columns: ", paste(required_reg_cols, collapse=", "))
+}
+
+# 3. Construct GRanges for TFBS scan results
+chrom <- if ("chromosome" %in% colnames(tfbs_df)) tfbs_df$chromosome else "chr11"
+tfbs_gr <- GRanges(
+  seqnames = chrom,
+  ranges   = IRanges(
+    start = tfbs_df$start_genomic,
+    end   = tfbs_df$end_genomic
+  ),
+  TF = tfbs_df$TF
+)
+
+# 4. Construct GRanges for regulatory regions
+reg_chrom <- if ("chromosome" %in% colnames(reg_df)) reg_df$chromosome else "chr11"
+reg_gr    <- GRanges(
+  seqnames = reg_chrom,
+  ranges   = IRanges(
+    start = reg_df$start,
+    end   = reg_df$end
+  ),
+  type = reg_df$type
+)
+
+# 5. Find overlaps
+ov <- findOverlaps(tfbs_gr, reg_gr, ignore.strand=TRUE)
+
+# 6. Extract overlapping entries
+tfbs_hits <- tfbs_gr[queryHits(ov)]
+reg_hits  <- reg_gr[subjectHits(ov)]
+
+# 7. Assemble output data.frame
+out_df <- data.frame(
+  TF             = mcols(tfbs_hits)$TF,
+  start_genomic  = start(tfbs_hits),
+  end_genomic    = end(tfbs_hits),
+  region_type    = mcols(reg_hits)$type,
+  region_start   = start(reg_hits),
+  region_end     = end(reg_hits),
+  stringsAsFactors = FALSE
+)
+
+# 8. Write the overlaps to a new Excel file
+output_path <- "/Users/cj719/MDK_promoter_TFBS_overlaps.xlsx"
+wb <- createWorkbook()
+addWorksheet(wb, "Overlaps")
+writeData(wb, "Overlaps", out_df)
+saveWorkbook(wb, output_path, overwrite=TRUE)
+
+message("Overlap analysis complete. Results written to: ", output_path)
