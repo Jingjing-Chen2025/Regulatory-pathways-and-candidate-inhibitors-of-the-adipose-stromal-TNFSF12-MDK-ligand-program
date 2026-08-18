@@ -1,0 +1,179 @@
+# R script to scan the human MDK promoter (GRCh38) for TFBS using JASPAR2020 & HOCOMOCO v13
+# ------------------------------------------------------------------------------
+# 1. Load packages
+library(biomaRt)                       # Ensembl annotation
+library(BSgenome.Hsapiens.UCSC.hg38)   # hg38 genome
+library(GenomicRanges)                 # GRanges manipulation
+library(TFBSTools)                     # motif scanning
+library(JASPAR2020)                    # remote JASPAR2020 access
+library(openxlsx)                      # write Excel
+library(ggplot2)                       # plotting
+
+# ------------------------------------------------------------------------------
+# 2. Retrieve MDK TSS from Ensembl (GRCh38)
+ensembl <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl"
+)
+dm1 <- getBM(
+  attributes = c("chromosome_name","transcription_start_site","strand"),
+  filters    = "refseq_mrna",
+  values     = "NM_001012334.2",
+  mart       = ensembl
+)
+if(nrow(dm1) == 0) {
+  message("RefSeq lookup failed; trying HGNC symbol")
+  dm2 <- getBM(
+    attributes = c("chromosome_name","transcription_start_site","strand"),
+    filters    = "hgnc_symbol",
+    values     = "MDK",
+    mart       = ensembl
+  )
+  if(nrow(dm2) > 0) {
+    mdk_meta <- dm2
+  } else {
+    warning("HGNC lookup also failed; using hard-coded TSS for MDK")
+    mdk_meta <- data.frame(
+      chromosome_name          = 11,
+      transcription_start_site = 46381068,
+      strand                   = 1
+    )
+  }
+} else {
+  mdk_meta <- dm1
+}
+chr    <- paste0("chr", mdk_meta$chromosome_name[1])
+tss    <- mdk_meta$transcription_start_site[1]
+strand <- ifelse(mdk_meta$strand[1] == 1, "+", "-")
+message(sprintf("Using MDK TSS at %s:%d on %s strand", chr, tss, strand))
+
+# ------------------------------------------------------------------------------
+# 3. Define promoter region ±50 kb around TSS
+prom_start <- tss - 50000
+prom_end   <- tss + 50000
+prom_seq <- getSeq(
+  BSgenome.Hsapiens.UCSC.hg38,
+  names = chr,
+  start = prom_start,
+  end   = prom_end
+)
+
+# ------------------------------------------------------------------------------
+# 4. Load PWMs
+# 4a. Remote JASPAR2020 (CORE, vertebrates, human)
+opts_jaspar <- list(
+  collection = "CORE",
+  tax_group  = "vertebrates",
+  species    = "Homo sapiens"
+)
+pwm_jaspar <- getMatrixSet(JASPAR2020, opts_jaspar)
+
+# 4b. Local HOCOMOCO v13 — reconstruct PFM blocks
+hoc_file <- "/Users/cj719/H13CORE_jaspar_format.txt"
+lines    <- readLines(hoc_file)
+hdr_idx  <- grep("^>", lines)
+processed <- character()
+bases <- c("A","C","G","T")
+for(i in hdr_idx) {
+  if(i + 4 > length(lines)) next
+  processed <- c(processed, lines[i])
+  block <- lines[(i+1):(i+4)]
+  # parse counts and format
+  mat <- strsplit(trimws(block), "\\s+")
+  for(j in seq_along(mat)) {
+    counts <- mat[[j]]
+    processed <- c(processed,
+                   paste0(bases[j], " [ ", paste(counts, collapse = " "), " ]"))
+  }
+}
+# write to temp file and read
+tmpfile <- tempfile(fileext = ".jaspar")
+writeLines(processed, tmpfile)
+pwm_hoco <- readJASPARMatrix(tmpfile, matrixClass = "PFM")
+
+# Exclude "ANDR.H13CORE.1.S.C" motif from HOCOMOCO
+pwm_hoco_v2 <- pwm_hoco[!names(pwm_hoco) %in% "ANDR.H13CORE.1.S.C"]
+
+# Combine PFMatrixLists
+pfms_all <- c(pwm_jaspar, pwm_hoco_v2)
+# Convert to probability-based PWMatrixList for scanning
+pwms_all <- toPWM(pfms_all, type = "prob", pseudocount = 1)
+
+# ------------------------------------------------------------------------------
+# 5. Scan promoter for each PWM
+hits_list <- lapply(pwms_all, function(pwm) {
+  searchSeq(pwm,
+            subject   = prom_seq,
+            min.score = "80%",
+            strand    = "*")
+})
+names(hits_list) <- name(pwms_all)
+
+# ------------------------------------------------------------------------------
+# 6. Compile results into results_df, including gene symbol for each TF
+extract_symbol <- function(tf_name) {
+  # If the name contains "ANDR", return "AR"
+  if (grepl("ANDR", tf_name)) return("AR")
+  # Find first occurrence of any of the delimiters: ".", "(", "-", ":"
+  loc_dot <- regexpr("\\.", tf_name)
+  loc_bracket <- regexpr("\\(", tf_name)
+  loc_hyphen <- regexpr("-", tf_name)
+  loc_colon <- regexpr(":", tf_name)
+  locs <- c(loc_dot, loc_bracket, loc_hyphen, loc_colon)
+  locs <- locs[locs > 0]
+  if(length(locs) == 0) {
+    return(tf_name)
+  }
+  min_loc <- min(locs) - 1 # subtract 1 to get chars before the delimiter
+  substr(tf_name, 1, min_loc)
+}
+
+data_list <- lapply(names(hits_list), function(tf) {
+  gr <- hits_list[[tf]]
+  if(length(gr) == 0) return(NULL)
+  gstart <- start(gr) + prom_start - 1
+  gend   <- end(gr)   + prom_start - 1
+  gene_symbol <- extract_symbol(tf)
+  data.frame(
+    TF            = tf,
+    Gene_Symbol   = gene_symbol,
+    chr           = chr,
+    start_genomic = gstart,
+    end_genomic   = gend,
+    strand        = as.character(strand(gr)),
+    start_rel     = gstart - tss,
+    end_rel       = gend   - tss,
+    stringsAsFactors = FALSE
+  )
+})
+results_df <- do.call(rbind, data_list)
+
+# ------------------------------------------------------------------------------
+# 7. Output results to Excel (optional)
+write.xlsx(results_df, file = "MDK_promoter_TFBS_scan.xlsx", overwrite = TRUE)
+
+# ------------------------------------------------------------------------------
+# 8. Visualize ESR1, EGR1, ANDR.H13CORE.0.P.B, ANDR.H13CORE.2.P.B binding sites
+
+motif_pattern <- "^ESR1$|^EGR1$|^ANDR\\.H13CORE\\.0\\.P\\.B$|^ANDR\\.H13CORE\\.2\\.P\\.B$"
+focus_idx <- grep(motif_pattern, results_df$TF)
+focus <- results_df[focus_idx, ]
+
+cat("Motif names included in plot:\n")
+print(unique(focus$TF))
+
+# Compute midpoint and y-axis direction for plotting
+focus$mid  <- (focus$start_rel + focus$end_rel) / 2
+focus$ymax <- ifelse(focus$strand == "+", 1, -1)
+
+# Plot
+ggplot(focus, aes(x = mid, y = 0, color = TF)) +
+  geom_linerange(aes(ymin = 0, ymax = ymax), size = 1.2) +
+  scale_x_continuous("Position rel to TSS (bp)",
+                     breaks = seq(-50000, 50000, by = 25000),
+                     labels = function(x) paste0(x/1000, "kb")) +
+  scale_y_continuous(NULL, breaks = c(-1, 1), labels = c("–strand", "+strand")) +
+  labs(title = "ESR1, EGR1, ANDR.H13CORE.0.P.B, ANDR.H13CORE.2.P.B binding sites in MDK Promoter") +
+  theme_classic()
+
+# EOF
