@@ -1,0 +1,180 @@
+# =========================
+# Adipose neighbors (GIANT/HumanBase edge list, gzipped)
+# Top/Bottom 250 for TNFSF12 & MDK + shared sets -> Excel
+# Streams with gzcat/zcat (no big memory load)
+# =========================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tibble)
+  library(openxlsx)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+# -------- Parameters --------
+gz_path   <- "/Volumes/Jingjing Chen/adipose_tissue.gz"
+gene_set  <- c("TNFSF12", "MDK")
+topN      <- 250
+outfile   <- "Adipose_TNFSF12_MDK_TopBottom250.xlsx"
+
+# -------- Helpers --------
+choose_cat <- function() {
+  if (nzchar(Sys.which("gzcat"))) return("gzcat")
+  if (nzchar(Sys.which("zcat")))  return("zcat")
+  return(NA_character_)
+}
+
+# SYMBOL -> ENTREZ (1:1) for seed genes
+map_symbol_to_entrez <- function(sym) {
+  ent <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys      = as.character(sym),
+    column    = "ENTREZID",
+    keytype   = "SYMBOL",
+    multiVals = "first"
+  ) |> unname()
+  ent <- ent[1]
+  if (is.na(ent) || is.null(ent)) stop("Could not map SYMBOL to Entrez ID for: ", sym)
+  as.character(ent)
+}
+
+# Stream all edges touching target_entrez; return tibble(partner_entrez, score, partner_symbol)
+stream_neighbors <- function(path, target_entrez) {
+  target_entrez <- as.character(target_entrez)
+  catcmd <- choose_cat()
+  is_gz  <- grepl("\\.gz$", path, ignore.case = TRUE)
+  if (is_gz && is.na(catcmd)) stop("Need gzcat or zcat in PATH to stream .gz files.")
+
+  qpath <- shQuote(path)
+  awk_expr <- sprintf("awk -v id=%s '($1==id || $2==id){print $0}'", shQuote(target_entrez))
+  cmd <- if (is_gz) sprintf("%s %s | %s", catcmd, qpath, awk_expr) else sprintf("cat %s | %s", qpath, awk_expr)
+
+  # Read streamed lines; first two columns are Entrez IDs (force character)
+  df <- suppressWarnings(
+    fread(cmd = cmd, sep = "\t", header = FALSE, showProgress = TRUE,
+          data.table = FALSE, colClasses = list(character = 1:2))
+  )
+  if (nrow(df) == 0) return(tibble(partner_entrez = character(), score = numeric(), partner_symbol = character()))
+
+  # Common HumanBase formats:
+  # 3 cols: entrez1, entrez2, score
+  # 4+ cols: entrez1, entrez2, posterior_known, score
+  if (ncol(df) == 3) {
+    colnames(df) <- c("entrez1","entrez2","score")
+  } else if (ncol(df) >= 4) {
+    colnames(df)[1:4] <- c("entrez1","entrez2","aux","score")
+    df <- df[, c("entrez1","entrez2","score")]
+  } else stop("Unexpected number of columns in the edge file.")
+
+  partner <- ifelse(df$entrez1 == target_entrez, df$entrez2, df$entrez1)
+  nb <- tibble(
+    partner_entrez = as.character(partner),
+    score          = as.numeric(df$score)
+  ) |>
+    distinct() |>
+    dplyr::filter(partner_entrez != target_entrez)  # drop self-edge if present
+
+  if (nrow(nb) == 0) return(nb |> mutate(partner_symbol = NA_character_))
+
+  # Map Entrez -> SYMBOL
+  sym_vec <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys      = nb$partner_entrez,
+    column    = "SYMBOL",
+    keytype   = "ENTREZID",
+    multiVals = "first"
+  )
+  sym_map <- tibble(ENTREZID = names(sym_vec), partner_symbol = unname(sym_vec))
+
+  nb |>
+    left_join(sym_map, by = c("partner_entrez" = "ENTREZID")) |>
+    arrange(desc(score), partner_symbol)
+}
+
+# Excel-safe sheet creator (<=31 chars, unique, no forbidden chars)
+.used_sheets <- character(0)
+add_ws <- function(wb, proposed){
+  nm <- gsub("[\\\\/?*\\[\\]:]", "_", proposed)
+  nm <- substr(nm, 1, 31)
+  base <- nm; i <- 1
+  while (nm %in% .used_sheets) {
+    nm <- substr(paste0(base, "_", i), 1, 31); i <- i + 1
+  }
+  openxlsx::addWorksheet(wb, nm)
+  .used_sheets <<- c(.used_sheets, nm)
+  nm
+}
+
+# -------- Main --------
+stopifnot(file.exists(gz_path))
+
+wb <- createWorkbook()
+per_gene <- list()
+
+for (sym in gene_set) {
+  message("Processing ", sym, " ...")
+  ent <- map_symbol_to_entrez(sym)
+  nb  <- stream_neighbors(gz_path, ent)
+  per_gene[[sym]] <- nb
+
+  top_tbl    <- nb |> dplyr::slice_head(n = min(topN, nrow(nb)))
+  bottom_tbl <- nb |> dplyr::arrange(score, partner_symbol) |> dplyr::slice_head(n = min(topN, nrow(nb)))
+
+  sn <- add_ws(wb, paste0(sym, " Top ", topN));    writeData(wb, sn, top_tbl)
+  sn <- add_ws(wb, paste0(sym, " Bottom ", topN)); writeData(wb, sn, bottom_tbl)
+}
+
+# Shared neighbors (across all genes in gene_set) + mean score
+if (length(per_gene) >= 2) {
+  shared_ids <- base::Reduce(
+    f = base::intersect,
+    x = lapply(per_gene, function(df) as.character(df$partner_entrez))
+  )
+
+  if (length(shared_ids) > 0) {
+    merged <- NULL
+    for (sym in names(per_gene)) {
+      df <- per_gene[[sym]] |>
+        dplyr::filter(partner_entrez %in% shared_ids) |>
+        dplyr::select(partner_entrez, partner_symbol, score) |>
+        dplyr::rename(!!paste0("score_", sym) := score)
+      merged <- if (is.null(merged)) df else dplyr::full_join(merged, df, by = c("partner_entrez","partner_symbol"))
+    }
+    score_cols <- grep("^score_", names(merged), value = TRUE)
+
+    merged <- merged |>
+      dplyr::mutate(score_mean = rowMeans(dplyr::across(all_of(score_cols)), na.rm = TRUE)) |>
+      dplyr::arrange(dplyr::desc(score_mean), partner_symbol)
+
+    sn <- add_ws(wb, "Shared neighbors"); writeData(wb, sn, merged)
+
+    # Use constant n in slice_head()
+    shared_top <- merged |> dplyr::slice_head(n = topN)
+    sn <- add_ws(wb, paste0("Shared Top ", topN)); writeData(wb, sn, shared_top)
+
+    shared_bottom <- merged |>
+      dplyr::filter(!is.na(score_mean)) |>
+      dplyr::arrange(score_mean, partner_symbol) |>
+      dplyr::slice_head(n = topN)
+    sn <- add_ws(wb, paste0("Shared Bottom ", topN)); writeData(wb, sn, shared_bottom)
+  }
+}
+
+# README sheet
+sn <- add_ws(wb, "README")
+notes <- tibble::tibble(
+  Note = c(
+    "Edge file is a gzipped HumanBase/GIANT tissue network.",
+    "Edges are posterior/score (higher = stronger).",
+    paste0("File: ", gz_path),
+    paste0("Genes: ", paste(gene_set, collapse = ", ")),
+    paste0("Top/Bottom N: ", topN),
+    "Shared = genes connected to ALL targets; ranked by mean score."
+  )
+)
+writeData(wb, sn, notes)
+
+saveWorkbook(wb, outfile, overwrite = TRUE)
+cat("Done. Wrote: ", normalizePath(outfile), "\n")
