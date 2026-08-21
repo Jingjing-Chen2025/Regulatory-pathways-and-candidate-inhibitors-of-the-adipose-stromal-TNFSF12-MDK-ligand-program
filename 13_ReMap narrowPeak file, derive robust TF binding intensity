@@ -1,0 +1,768 @@
+############################################################
+# Integrated Pipeline (FINAL UPDATED VERSION + promoter tracks):
+# Diagnose ReMap narrowPeak file, derive robust TF binding intensity,
+# visualize TF binding on TNFSF12 & MDK promoters (promoter_binding_tracks_*.pdf).
+#
+# Metrics per TF per promoter:
+#   - Promoter_Top3, Promoter_Top10p, Promoter_SumPos, Promoter_FinalBIS, PeakCount
+#
+# Cell type stratification:
+#   - Uses histone mark tagAlign overlaps as a promoter accessibility proxy.
+#
+# Per-peak composite (CombCore):
+#   mean( z_log_signal, z_signal_per_bp, z_sharpness, z_score )
+# (qValue auto-excluded if implausible; included if distribution plausible.)
+#
+# NOTE (PATCH): Added global background scaling for z-scores to prevent
+#               tiny-scale explosions when using very small promoter subsets.
+#
+# Outputs:
+#   promoter_binding_tracks_YYYYMMDD_HHMMSS.pdf
+#   promoter_tf_binding_metrics.csv
+#   promoter_tf_binding_metrics_by_celltype.csv (if accessibility data)
+#   promoter_tf_binding_scatter_global.pdf
+#   promoter_tf_binding_scatter_by_celltype.pdf
+#
+# CHANGE (requested): Removed code that generated tf_binding_intensity_scatter_combined_*.pdf
+############################################################
+
+############################
+# 0) CONFIGURATION
+############################
+remap_local_override <- "/Volumes/Jingjing Chen/remap2022_nr_macs2_hg38_v1_0.bed.gz"
+
+genes_of_interest <- c("TNFSF12","MDK")
+
+tf_list <- c(
+  "HEYL","GLI2","GLI1","HIC1","TWIST2","TWIST1","MITF","EBF1","GATA2",
+  "FOXL1","FOXC2","FOXF1","EGR2","ESR1","NR2F1","ATF5","FOS","WT1",
+  "EGR1","AR","SNAI2","JUN","ETV1","RARG","FOSL1","MYC","JUNB",
+  "HAND2","SNAI1","EPAS1","PHOX2A","MSC","CTCF","RAD21","FOXA1","BRD4"
+)
+
+# Histone marks for accessibility (optional)
+histone_marks <- c("H3K27ac","H3K4me1")
+local_tagalign_base <- "/Volumes/Jingjing Chen/Roadmap"
+tagalign_files <- list(
+  adipose_sub     = file.path(local_tagalign_base, paste0("E063-", histone_marks, ".tagAlign.gz")),
+  adipose_vis     = file.path(local_tagalign_base, paste0("E065-", histone_marks, ".tagAlign.gz")),
+  admsc           = file.path(local_tagalign_base, paste0("E025-", histone_marks, ".tagAlign.gz")),
+  skeleton_muscle = file.path(local_tagalign_base, paste0("E100-", histone_marks, ".tagAlign.gz"))
+)
+min_reads_accessibility <- 10
+
+promoter_upstream  <- 2000
+promoter_downstream<- 500
+extended_fallback_upstream   <- 5000
+extended_fallback_downstream <- 1000
+
+# Weights for final promoter score
+w_top3   <- 0.5
+w_top10p <- 0.3
+w_sumpos <- 0.2
+
+# Output paths
+plot_global_pdf    <- file.path(getwd(), "promoter_tf_binding_scatter_global.pdf")
+plot_celltype_pdf  <- file.path(getwd(), "promoter_tf_binding_scatter_by_celltype.pdf")
+tracks_pdf         <- file.path(getwd(), paste0("promoter_binding_tracks_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".pdf"))
+
+# PATCH: global scaling configuration
+use_global_scalers       <- TRUE
+global_scaler_sample_n   <- 300000L
+global_scaler_clip       <- 15
+min_scaler_variability   <- 1e-6
+min_qvalue_finite_needed <- 100
+
+############################
+# 1) PACKAGES
+############################
+required_pkgs <- c(
+  "data.table","rtracklayer","GenomicRanges","IRanges","S4Vectors","GenomeInfoDb",
+  "GenomicFeatures","TxDb.Hsapiens.UCSC.hg38.knownGene","AnnotationDbi","org.Hs.eg.db",
+  "Rsamtools","ggplot2","ggrepel","Gviz","grid","gridExtra"
+)
+to_install <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly=TRUE)]
+if(length(to_install)){
+  if(!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+  cran_pkgs <- setdiff(to_install, c("GenomicFeatures","TxDb.Hsapiens.UCSC.hg38.knownGene","org.Hs.eg.db"))
+  if(length(cran_pkgs)) install.packages(cran_pkgs)
+  bioc_pkgs <- intersect(to_install, c("GenomicFeatures","TxDb.Hsapiens.UCSC.hg38.knownGene","org.Hs.eg.db"))
+  if(length(bioc_pkgs)) BiocManager::install(bioc_pkgs, ask=FALSE, update=FALSE)
+}
+suppressPackageStartupMessages({
+  library(data.table); library(rtracklayer); library(GenomicRanges); library(IRanges); library(S4Vectors)
+  library(GenomeInfoDb); library(GenomicFeatures); library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(AnnotationDbi); library(org.Hs.eg.db)
+  library(Rsamtools); library(ggplot2); library(ggrepel)
+  library(Gviz); library(grid); library(gridExtra)
+})
+
+############################
+# 2) HELPERS
+############################
+safe_numeric <- function(x, na_tokens=c("NA","NaN","nan",".","","Inf","-Inf")){
+  if(is.factor(x)) x <- as.character(x)
+  if(!is.character(x)) return(suppressWarnings(as.numeric(x)))
+  x <- trimws(x); x[x %in% na_tokens] <- NA_character_
+  x <- gsub(",", "", x, fixed=TRUE)
+  bad <- !grepl("^[+-]?[0-9]*\\.?[0-9]+([eE][+-]?[0-9]+)?$", x) & !is.na(x)
+  if(any(bad)) x[bad] <- NA_character_
+  suppressWarnings(as.numeric(x))
+}
+winsorize <- function(x, probs=c(0.001,0.999)){
+  if(all(is.na(x))) return(x)
+  q <- stats::quantile(x, probs=probs, na.rm=TRUE)
+  pmin(pmax(x, q[1]), q[2])
+}
+robust_z <- function(x){
+  x <- suppressWarnings(as.numeric(x))
+  if(all(is.na(x))) return(rep(NA_real_, length(x)))
+  fx <- x[is.finite(x)]
+  if(!length(fx)) return(rep(NA_real_, length(x)))
+  ctr <- stats::median(fx, na.rm=TRUE)
+  sc  <- stats::mad(fx, constant=1.4826, na.rm=TRUE)
+  if(is.na(sc) || sc==0){
+    sc <- stats::sd(fx, na.rm=TRUE); if(is.na(sc) || sc==0) sc <- 1e-8
+  }
+  z <- (x - ctr)/sc; z[!is.finite(z)] <- NA_real_; z
+}
+extract_tf <- function(nm){
+  tf <- sub("^.*TF=([^;]+).*$","\\1",nm)
+  tf2 <- ifelse(tf==nm, sub("_meta.*$","",nm), tf)
+  tf3 <- ifelse(tf2==nm, sub("\\s.*$","",tf2), tf2)
+  tf3 <- sub("[-|:].*$","",tf3)
+  ifelse(nchar(tf3)==0, NA_character_, tf3)
+}
+qvalue_plausible <- function(qv){
+  qv <- qv[is.finite(qv)]; if(!length(qv)) return(FALSE)
+  rng <- range(qv, na.rm=TRUE)
+  if(rng[1] >= 0 && rng[2] <= 1) return(TRUE)
+  if(rng[2] < 1e4) return(TRUE)
+  FALSE
+}
+ensure_bgzip_tabix <- function(in_path){
+  bgz <- paste0(in_path,".bgz"); tbi <- paste0(bgz,".tbi")
+  if(!file.exists(bgz) || file.mtime(bgz) < file.mtime(in_path)){
+    message("bgzip compressing ReMap file ..."); Rsamtools::bgzip(in_path, dest=bgz, overwrite=TRUE)
+  }
+  if(!file.exists(tbi)){ message("Indexing tabix ..."); Rsamtools::indexTabix(bgz, format="bed") }
+  bgz
+}
+
+tabix_subset_bed_to_gr <- function(bgz_path, which_gr, flank = 0L,
+                                   debug = FALSE, max_lines = Inf) {
+  if (!requireNamespace("Rsamtools", quietly = TRUE))
+    stop("Rsamtools required.")
+  if (!file.exists(bgz_path))
+    stop("BGZF not found: ", bgz_path)
+  if (is.numeric(flank) && flank > 0L)
+    which_gr <- IRanges::resize(which_gr, width = width(which_gr) + 2L * flank, fix = "center")
+  tf <- Rsamtools::TabixFile(bgz_path)
+  on.exit(try(close(tf), silent = TRUE), add = TRUE)
+  idx_seqs <- tryCatch(Rsamtools::seqnamesTabix(tf), error = function(e) character(0))
+  if (length(idx_seqs)) {
+    style <- if (any(grepl("^chr", idx_seqs))) "UCSC" else "NCBI"
+    GenomeInfoDb::seqlevelsStyle(which_gr) <- style
+    which_gr <- which_gr[as.character(GenomicRanges::seqnames(which_gr)) %in% idx_seqs]
+    if (!length(which_gr)) {
+      if (debug) message("[tabix_subset] No query intervals match the index.")
+      return(GenomicRanges::GRanges())
+    }
+  }
+  raw_chunks <- Rsamtools::scanTabix(tf, param = which_gr)
+  if (!length(raw_chunks)) {
+    if (debug) message("[tabix_subset] No lines returned.")
+    return(GenomicRanges::GRanges())
+  }
+  lines <- unique(unlist(raw_chunks, use.names = FALSE))
+  if (!length(lines)) {
+    if (debug) message("[tabix_subset] Empty after uniqueness filter.")
+    return(GenomicRanges::GRanges())
+  }
+  if (is.finite(max_lines) && length(lines) > max_lines)
+    lines <- lines[seq_len(max_lines)]
+  df <- tryCatch(
+    utils::read.table(text = lines, sep = "\t", header = FALSE,
+                      quote = "", comment.char = "", stringsAsFactors = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(df) || !nrow(df) || ncol(df) < 3) {
+    if (debug) message("[tabix_subset] Parsed data invalid.")
+    return(GenomicRanges::GRanges())
+  }
+  colnames(df) <- paste0("V", seq_len(ncol(df)))
+  starts <- suppressWarnings(as.integer(df$V2) + 1L)
+  ends   <- suppressWarnings(as.integer(df$V3))
+  keep   <- is.finite(starts) & is.finite(ends) & (ends >= starts)
+  if (!any(keep)) {
+    if (debug) message("[tabix_subset] All rows failed coordinate validation.")
+    return(GenomicRanges::GRanges())
+  }
+  df     <- df[keep, , drop = FALSE]
+  starts <- starts[keep]; ends <- ends[keep]
+  gr <- GenomicRanges::GRanges(df$V1, IRanges::IRanges(starts, ends))
+  if (ncol(df) >= 6) {
+    s <- ifelse(df$V6 %in% c("+","-"), df$V6, "*")
+    GenomicRanges::strand(gr) <- s
+  }
+  meta_list <- list()
+  if (ncol(df) >= 4)  meta_list$name        <- df$V4
+  if (ncol(df) >= 5)  meta_list$score       <- suppressWarnings(as.numeric(df$V5))
+  if (ncol(df) >= 7)  meta_list$signalValue <- suppressWarnings(as.numeric(df$V7))
+  if (ncol(df) >= 8)  meta_list$pValue      <- suppressWarnings(as.numeric(df$V8))
+  if (ncol(df) >= 9)  meta_list$qValue      <- suppressWarnings(as.numeric(df$V9))
+  if (ncol(df) >= 10) meta_list$peak        <- suppressWarnings(as.integer(df$V10))
+  meta_df <- data.frame(meta_list, stringsAsFactors = FALSE, check.names = FALSE)
+  if (nrow(meta_df) != length(gr))
+    stop("[tabix_subset] Metadata row mismatch: ", nrow(meta_df), " vs GRanges length ", length(gr))
+  meta_df <- S4Vectors::DataFrame(meta_df)
+  reserved <- c("seqnames","ranges","strand","seqlevels","seqlengths",
+                "isCircular","start","end","width","element")
+  keep_cols <- setdiff(colnames(meta_df), reserved)
+  S4Vectors::mcols(gr) <- meta_df[, keep_cols, drop = FALSE]
+  if (length(idx_seqs))
+    GenomeInfoDb::seqlevelsStyle(gr) <- if (any(grepl("^chr", idx_seqs))) "UCSC" else "NCBI"
+  if (debug) {
+    message("[tabix_subset] Returned ", length(gr), " peaks; metadata columns: ",
+            paste(colnames(S4Vectors::mcols(gr)), collapse = ", "))
+  }
+  gr
+}
+
+subsetByOverlaps_compat <- function(query, subject, ignore.strand=TRUE, type="any", minoverlap=1L){
+  hits <- GenomicRanges::findOverlaps(query, subject, type=type, minoverlap=minoverlap, ignore.strand=ignore.strand)
+  if(!length(hits)) return(query[0])
+  query[unique(S4Vectors::queryHits(hits))]
+}
+
+.compute_scalers_from_sample <- function(remap_path, sample_n=300000L, probs=c(0.001,0.999),
+                                         min_var=1e-6, clip=15){
+  if(!file.exists(remap_path)) stop("ReMap file not found for scaler computation: ", remap_path)
+  dt_bg <- tryCatch(
+    data.table::fread(remap_path, sep="\t", header=FALSE, nrows=sample_n, showProgress=FALSE),
+    error=function(e) NULL
+  )
+  if(is.null(dt_bg) || !nrow(dt_bg)) return(NULL)
+  if(ncol(dt_bg) < 7) return(NULL)
+  if(ncol(dt_bg) > 10) dt_bg <- dt_bg[, 1:10]
+  data.table::setnames(dt_bg, paste0("V", seq_len(ncol(dt_bg))))
+  width_bg  <- suppressWarnings(as.numeric(dt_bg$V3) - as.numeric(dt_bg$V2))
+  width_bg[!is.finite(width_bg) | width_bg <= 0] <- NA_real_
+  sig_bg    <- suppressWarnings(as.numeric(dt_bg$V7))
+  score_bg  <- suppressWarnings(as.numeric(dt_bg$V5))
+  log_bg    <- log1p(sig_bg)
+  perbp_bg  <- sig_bg / width_bg
+  alpha     <- 0.5
+  sharp_bg  <- sig_bg / (width_bg^alpha)
+  wz <- function(x){ if(all(is.na(x))) return(x); q <- stats::quantile(x, probs=probs, na.rm=TRUE); pmin(pmax(x,q[1]),q[2]) }
+  log_w    <- wz(log_bg); perbp_w <- wz(perbp_bg); sharp_w <- wz(sharp_bg); score_w <- wz(score_bg)
+  cs <- function(x){
+    fx <- x[is.finite(x)]
+    if(!length(fx)) return(list(center=NA_real_, scale=NA_real_))
+    ctr <- stats::median(fx, na.rm=TRUE)
+    sc  <- stats::mad(fx, constant=1.4826, na.rm=TRUE)
+    if(is.na(sc) || sc < min_var){
+      sc <- stats::sd(fx, na.rm=TRUE)
+      if(is.na(sc) || sc < min_var) return(list(center=ctr, scale=NA_real_))
+    }
+    list(center=ctr, scale=sc)
+  }
+  list(
+    log_signal   = cs(log_w),
+    signal_perbp = cs(perbp_w),
+    sharpness    = cs(sharp_w),
+    score        = cs(score_w),
+    clip         = clip
+  )
+}
+
+.apply_scaler <- function(x, scaler, probs=c(0.001,0.999), clip=15){
+  if(is.null(scaler) || is.na(scaler$center) || is.na(scaler$scale)) return(rep(NA_real_, length(x)))
+  if(all(is.na(x))) return(rep(NA_real_, length(x)))
+  q <- stats::quantile(x, probs=probs, na.rm=TRUE)
+  xw <- pmin(pmax(x, q[1]), q[2])
+  z  <- (xw - scaler$center) / scaler$scale
+  z[abs(z) > clip] <- clip * sign(z[abs(z) > clip])
+  z[!is.finite(z)] <- NA_real_
+  z
+}
+
+############################
+# 3) PROMOTER RANGES
+############################
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+entrez <- AnnotationDbi::mapIds(org.Hs.eg.db, keys=genes_of_interest,
+                                column="ENTREZID", keytype="SYMBOL", multiVals="first")
+prom_all <- GenomicFeatures::promoters(GenomicFeatures::genes(txdb),
+                                       upstream=promoter_upstream, downstream=promoter_downstream)
+std <- GenomeInfoDb::standardChromosomes(prom_all)
+prom_all <- GenomeInfoDb::keepSeqlevels(prom_all, std, pruning.mode="coarse")
+prom_all <- GenomicRanges::trim(prom_all)
+prom_sel <- prom_all[names(prom_all) %in% entrez]
+symbol_by_entrez <- setNames(names(entrez), entrez)
+names(prom_sel) <- symbol_by_entrez[names(prom_sel)]
+prom_list <- S4Vectors::split(prom_sel, names(prom_sel))
+prom_sel  <- GenomicRanges::reduce(prom_list)
+prom_sel  <- base::unlist(prom_sel, use.names=TRUE)
+
+############################
+# 4) LOAD / SUBSET ReMap
+############################
+if(!file.exists(remap_local_override)) stop("ReMap file not found: ", remap_local_override)
+bgz_path <- ensure_bgzip_tabix(remap_local_override)
+remap_promoter <- tabix_subset_bed_to_gr(bgz_path, prom_sel)
+if(!length(remap_promoter) && "TNFSF12" %in% genes_of_interest){
+  message("Extending TNFSF12 promoter due to no TF peaks.")
+  eid <- entrez["TNFSF12"]
+  ext_prom <- GenomicFeatures::promoters(GenomicFeatures::genes(txdb)[names(GenomicFeatures::genes(txdb))==eid],
+                                         upstream=extended_fallback_upstream,
+                                         downstream=extended_fallback_downstream)
+  names(ext_prom) <- "TNFSF12"
+  prom_sel <- c(prom_sel[names(prom_sel)!="TNFSF12"], ext_prom)
+  remap_promoter <- c(remap_promoter, tabix_subset_bed_to_gr(bgz_path, ext_prom))
+}
+if(!length(remap_promoter)) stop("No ReMap peaks in target promoters.")
+if(!"TF" %in% colnames(S4Vectors::mcols(remap_promoter))){
+  parsed <- extract_tf(remap_promoter$name)
+  parsed[parsed == remap_promoter$name] <- NA_character_
+  remap_promoter$TF <- parsed
+}
+if(!is.null(tf_list)){
+  remap_promoter <- remap_promoter[!is.na(remap_promoter$TF) & remap_promoter$TF %in% tf_list]
+}
+if(!length(remap_promoter)) stop("No promoter peaks remain after TF filtering.")
+
+############################
+# 5) PER-PEAK INTENSITY COMPONENTS
+############################
+dt <- data.table::data.table(
+  TF = remap_promoter$TF,
+  signalValue = safe_numeric(remap_promoter$signalValue),
+  score = safe_numeric(remap_promoter$score),
+  width = GenomicRanges::width(remap_promoter),
+  name = remap_promoter$name
+)
+dt[, log_signal    := log1p(signalValue)]
+dt[, signal_per_bp := signalValue / width]
+dt[!is.finite(signal_per_bp), signal_per_bp := NA_real_]
+alpha <- 0.5
+dt[, sharpness := signalValue / (width^alpha)]
+dt[!is.finite(sharpness), sharpness := NA_real_]
+
+scalers <- NULL
+if(use_global_scalers){
+  scalers <- .compute_scalers_from_sample(remap_local_override, sample_n=global_scaler_sample_n,
+                                          probs=c(0.001,0.999),
+                                          min_var=min_scaler_variability,
+                                          clip=global_scaler_clip)
+}
+if(!is.null(scalers)){
+  dt[, z_log_signal     := .apply_scaler(log_signal,    scalers$log_signal,   clip=scalers$clip)]
+  dt[, z_signal_per_bp  := .apply_scaler(signal_per_bp, scalers$signal_perbp, clip=scalers$clip)]
+  dt[, z_sharpness      := .apply_scaler(sharpness,     scalers$sharpness,    clip=scalers$clip)]
+  dt[, z_score          := .apply_scaler(score,         scalers$score,        clip=scalers$clip)]
+} else {
+  dt[, log_signal_w     := winsorize(log_signal)]
+  dt[, signal_per_bp_w  := winsorize(signal_per_bp)]
+  dt[, sharpness_w      := winsorize(sharpness)]
+  dt[, score_w          := winsorize(score)]
+  dt[, z_log_signal     := robust_z(log_signal_w)]
+  dt[, z_signal_per_bp  := robust_z(signal_per_bp_w)]
+  dt[, z_sharpness      := robust_z(sharpness_w)]
+  dt[, z_score          := robust_z(score_w)]
+  for(col in c("z_log_signal","z_signal_per_bp","z_sharpness","z_score")){
+    z <- dt[[col]]
+    z[abs(z) > global_scaler_clip] <- global_scaler_clip * sign(z[abs(z) > global_scaler_clip])
+    dt[[col]] <- z
+  }
+}
+
+dt[, z_q := NA_real_]
+q_in <- "qValue" %in% colnames(S4Vectors::mcols(remap_promoter))
+if (q_in) {
+  qv_raw <- safe_numeric(remap_promoter$qValue)
+  fin <- is.finite(qv_raw)
+  if (sum(fin) >= min_qvalue_finite_needed) {
+    if (max(qv_raw[fin], na.rm=TRUE) <= 1) {
+      qv_trans <- -log10(qv_raw + 1e-12)
+    } else {
+      qv_trans <- qv_raw
+    }
+    if(!is.null(scalers)){
+      ctr <- stats::median(qv_trans[fin], na.rm=TRUE)
+      mad_val <- stats::mad(qv_trans[fin], constant=1.4826, na.rm=TRUE)
+      sd_val  <- stats::sd(qv_trans[fin], na.rm=TRUE)
+      if(!is.na(mad_val) && mad_val >= min_scaler_variability){
+        z_tmp <- (pmin(pmax(qv_trans, stats::quantile(qv_trans, 0.001, na.rm=TRUE)),
+                       stats::quantile(qv_trans, 0.999, na.rm=TRUE)) - ctr) / mad_val
+      } else if(!is.na(sd_val) && sd_val >= min_scaler_variability){
+        z_tmp <- (pmin(pmax(qv_trans, stats::quantile(qv_trans, 0.001, na.rm=TRUE)),
+                       stats::quantile(qv_trans, 0.999, na.rm=TRUE)) - ctr) / sd_val
+      } else {
+        z_tmp <- rep(NA_real_, length(qv_trans))
+      }
+    } else {
+      qv_w <- winsorize(qv_trans)
+      z_tmp <- robust_z(qv_w)
+    }
+    z_tmp[abs(z_tmp) > global_scaler_clip] <- global_scaler_clip * sign(z_tmp[abs(z_tmp) > global_scaler_clip])
+    dt[, z_q := z_tmp]
+  } else {
+    message("qValue has fewer than ", min_qvalue_finite_needed, " finite values; excluding from composite.")
+  }
+} else {
+  message("qValue column not present; excluding from composite.")
+}
+
+dt[, CombCore := rowMeans(cbind(z_log_signal, z_signal_per_bp, z_sharpness, z_score), na.rm=TRUE)]
+dt[!is.finite(CombCore), CombCore := NA_real_]
+frac_zq <- mean(is.finite(dt$z_q))
+if (is.finite(frac_zq) && frac_zq >= 0.8) {
+  dt[, CombCorePlus := rowMeans(cbind(CombCore, z_q), na.rm=TRUE)]
+  dt[!is.finite(CombCorePlus), CombCorePlus := NA_real_]
+  composite_col <- "CombCorePlus"
+  message(sprintf("Using CombCorePlus (includes qValue). Finite z_q fraction=%.2f", frac_zq))
+} else {
+  composite_col <- "CombCore"
+  message(sprintf("Using CombCore (signal-derived only). Finite z_q fraction=%.2f", ifelse(is.finite(frac_zq), frac_zq, 0)))
+}
+selected_composite_name <- composite_col
+
+############################
+# 6) PROMOTER-SPECIFIC AGGREGATION
+############################
+ov <- GenomicRanges::findOverlaps(prom_sel, remap_promoter)
+prom_df <- data.frame(
+  Gene = names(prom_sel)[S4Vectors::queryHits(ov)],
+  TF   = remap_promoter$TF[S4Vectors::subjectHits(ov)],
+  Composite = dt[[composite_col]][S4Vectors::subjectHits(ov)]
+)
+aggregate_promoter <- function(df){
+  if(!nrow(df)) return(data.frame())
+  split_list <- split(df, df$TF)
+  res <- lapply(split_list, function(sub){
+    vals <- sub$Composite[is.finite(sub$Composite)]
+    if(!length(vals)){
+      return(data.frame(TF=sub$TF[1], PeakCount=0,
+                        Promoter_Mean=NA_real_, Promoter_Max=NA_real_,
+                        Promoter_Top3=NA_real_, Promoter_Top10p=NA_real_, Promoter_SumPos=NA_real_))
+    }
+    ord <- sort(vals, decreasing=TRUE)
+    top3n <- min(3L, length(vals)); top10n <- max(1L, floor(0.10 * length(vals)))
+    data.frame(
+      TF = sub$TF[1],
+      PeakCount = length(vals),
+      Promoter_Mean = mean(vals),
+      Promoter_Max  = max(vals),
+      Promoter_Top3 = mean(ord[seq_len(top3n)]),
+      Promoter_Top10p = mean(ord[seq_len(top10n)]),
+      Promoter_SumPos = sum(ord[ord > 0]) / sqrt(length(vals))
+    )
+  })
+  do.call(rbind, res)
+}
+promoter_tf_binding <- do.call(rbind, lapply(genes_of_interest, function(g){
+  sub <- prom_df[prom_df$Gene==g,]; if(!nrow(sub)) return(NULL)
+  agg <- aggregate_promoter(sub); if(!nrow(agg)) return(NULL)
+  agg$Gene <- g; agg
+}))
+if(!nrow(promoter_tf_binding)) stop("No promoter TF binding metrics computed.")
+promoter_tf_binding <- promoter_tf_binding[order(promoter_tf_binding$Gene,
+                                                 -promoter_tf_binding$Promoter_Top3,
+                                                 -promoter_tf_binding$Promoter_Max),]
+
+############################
+# 7) ACCESSIBILITY BY CELL TYPE
+############################
+get_tagalign_gr <- function(path){
+  if(!file.exists(path)) return(GenomicRanges::GRanges())
+  tryCatch(rtracklayer::import(path, format="BED"), error=function(e) GenomicRanges::GRanges())
+}
+prom_acc_list <- list()
+for(ct in names(tagalign_files)){
+  ct_files <- tagalign_files[[ct]]
+  max_counts_gene <- setNames(integer(length(prom_sel)), names(prom_sel))
+  for(f in ct_files){
+    gr_tag <- get_tagalign_gr(f); if(!length(gr_tag)) next
+    ovp <- subsetByOverlaps_compat(gr_tag, prom_sel, ignore.strand=TRUE, type="any", minoverlap=1L)
+    if(!length(ovp)) next
+    counts <- GenomicRanges::countOverlaps(prom_sel, ovp); names(counts) <- names(prom_sel)
+    max_counts_gene <- pmax(max_counts_gene, counts, na.rm=TRUE)
+  }
+  accessible <- names(max_counts_gene)[max_counts_gene > min_reads_accessibility]
+  prom_acc_list[[ct]] <- if(length(accessible)) prom_sel[names(prom_sel) %in% accessible] else GenomicRanges::GRanges()
+}
+
+############################
+# 8) PER-CELL-TYPE PROMOTER INTENSITY
+############################
+promoter_tf_binding_ct <- do.call(rbind, lapply(names(prom_acc_list), function(ct){
+  acc_prom <- prom_acc_list[[ct]]; if(!length(acc_prom)) return(NULL)
+  lapply(genes_of_interest, function(g){
+    if(!(g %in% names(acc_prom))) return(NULL)
+    sub <- prom_df[prom_df$Gene==g,]; if(!nrow(sub)) return(NULL)
+    agg <- aggregate_promoter(sub); if(!nrow(agg)) return(NULL)
+    agg$Gene <- g; agg$CellType <- ct; agg
+  })
+}))
+promoter_tf_binding_ct <- if(length(promoter_tf_binding_ct)) do.call(rbind, promoter_tf_binding_ct) else data.frame()
+
+############################
+# 9) FINAL PROMOTER SCORE
+############################
+add_final_promoter_score <- function(df){
+  if(!nrow(df)) return(df)
+  robust_vec_z <- function(x){
+    x <- as.numeric(x); if(all(is.na(x))) return(rep(NA_real_, length(x)))
+    ctr <- stats::median(x, na.rm=TRUE); sc <- stats::mad(x, constant=1.4826, na.rm=TRUE)
+    if(is.na(sc) || sc==0){ sc <- stats::sd(x, na.rm=TRUE); if(is.na(sc) || sc==0) sc <- 1e-8 }
+    z <- (x - ctr)/sc; z[!is.finite(z)] <- NA_real_; z
+  }
+  df$z_Top3   <- robust_vec_z(df$Promoter_Top3)
+  df$z_Top10p <- robust_vec_z(df$Promoter_Top10p)
+  df$z_SumPos <- robust_vec_z(df$Promoter_SumPos)
+  df$Promoter_FinalBIS <- rowMeans(cbind(w_top3*df$z_Top3,
+                                         w_top10p*df$z_Top10p,
+                                         w_sumpos*df$z_SumPos), na.rm=TRUE)
+  df[!is.finite(df$Promoter_FinalBIS),"Promoter_FinalBIS"] <- NA_real_
+  df
+}
+promoter_tf_binding    <- add_final_promoter_score(promoter_tf_binding)
+promoter_tf_binding_ct <- add_final_promoter_score(promoter_tf_binding_ct)
+
+############################
+# 10) PLOTS (global/cell-type promoter intensity)
+############################
+ylab_text <- if (exists("selected_composite_name") && identical(selected_composite_name, "CombCorePlus")) {
+  "Promoter Top3 composite intensity (includes qValue)"
+} else {
+  "Promoter Top3 composite intensity (signal-derived only)"
+}
+pdf(plot_global_pdf, width=9, height=6)
+if(nrow(promoter_tf_binding)){
+  p_global <- ggplot2::ggplot(promoter_tf_binding,
+                     ggplot2::aes(PeakCount, Promoter_Top3, color=Gene, label=TF)) +
+    ggplot2::geom_point(size=3, alpha=0.85, na.rm=TRUE) +
+    ggrepel::geom_text_repel(size=3, max.overlaps=Inf, box.padding=0.3,
+                             point.padding=0.2, segment.color="grey60",
+                             segment.alpha=0.6, na.rm=TRUE) +
+    ggplot2::facet_wrap(~Gene, scales="free_y") +
+    ggplot2::labs(title="TF Promoter Binding Intensity (Top3) vs Peak Count",
+         x="Promoter-overlapping peak count",
+         y=ylab_text,
+         color="Gene") +
+    ggplot2::theme_minimal(base_size=12) +
+    ggplot2::theme(panel.grid=ggplot2::element_line(color="grey90"))
+  print(p_global)
+} else { plot.new(); title("No promoter TF binding data.") }
+dev.off(); message("Global promoter scatter saved: ", plot_global_pdf)
+
+pdf(plot_celltype_pdf, width=11, height=8)
+if(nrow(promoter_tf_binding_ct)){
+  promoter_tf_binding_ct$CellType <- factor(promoter_tf_binding_ct$CellType,
+                                            levels=names(tagalign_files))
+  p_ct <- ggplot2::ggplot(promoter_tf_binding_ct,
+                 ggplot2::aes(PeakCount, Promoter_Top3, color=CellType, label=TF)) +
+    ggplot2::geom_point(size=2.5, alpha=0.9, na.rm=TRUE) +
+    ggrepel::geom_text_repel(size=2.6, max.overlaps=Inf, box.padding=0.25,
+                             point.padding=0.15, segment.color="grey60",
+                             segment.alpha=0.5, na.rm=TRUE) +
+    ggplot2::facet_grid(CellType ~ Gene, scales="free_y") +
+    ggplot2::labs(title="TF Promoter Binding Intensity (Top3) by Cell Type Accessibility",
+         x="Promoter-overlapping peak count",
+         y=ylab_text,
+         color="Cell type") +
+    ggplot2::theme_minimal(base_size=12) +
+    ggplot2::theme(panel.grid=ggplot2::element_line(color="grey92"),
+          strip.text=ggplot2::element_text(face="bold"))
+  print(p_ct)
+} else { plot.new(); title("No cell-type accessibility data.") }
+dev.off(); message("Cell-type promoter scatter saved: ", plot_celltype_pdf)
+
+############################
+# 10A) PROMOTER BINDING TRACKS (Gviz)
+############################
+.ta_cache_single <- new.env(parent = emptyenv())
+get_tagalign_gr_cached <- function(path){
+  if(!nzchar(path) || !file.exists(path)) return(GenomicRanges::GRanges())
+  key <- normalizePath(path, mustWork=FALSE)
+  if(!exists(key, envir=.ta_cache_single, inherits=FALSE)){
+    gr <- get_tagalign_gr(path); assign(key, gr, envir=.ta_cache_single)
+  }
+  get(key, envir=.ta_cache_single, inherits=FALSE)
+}
+ct_colors <- c(
+  adipose_sub="#1f77b4",
+  adipose_vis="#2ca02c",
+  admsc="#9467bd",
+  skeleton_muscle="#8c564b"
+)
+mark_colors <- c(H3K27ac="#e74c3c", H3K4me1="#f39c12")
+make_tf_annotation_track <- function(peaks_gr, genome, chr, name_prefix="", label_color="black", label_cex=0.85){
+  if(!length(peaks_gr))
+    return(AnnotationTrack(GenomicRanges::GRanges(), genome=genome, chromosome=chr,
+                           name=paste0(name_prefix," (no TF peaks)"),
+                           background.title="white"))
+  peaks_true <- peaks_gr
+  bins <- IRanges::disjointBins(GenomicRanges::ranges(peaks_true))
+  S4Vectors::mcols(peaks_true)$level <- bins
+  S4Vectors::mcols(peaks_true)$group <- S4Vectors::mcols(peaks_true)$TF
+  S4Vectors::mcols(peaks_true)$id    <- S4Vectors::mcols(peaks_true)$TF
+  tr <- AnnotationTrack(
+    peaks_true, genome=genome, chromosome=chr,
+    name=name_prefix, feature=S4Vectors::mcols(peaks_true)$TF,
+    group=S4Vectors::mcols(peaks_true)$group, id=S4Vectors::mcols(peaks_true)$id,
+    stacking="full", showFeatureNames=TRUE, featureAnnotation="id",
+    col=label_color, fill=grDevices::adjustcolor(label_color, alpha.f=0.00),
+    background.panel="#fafafa", background.title="white"
+  )
+  displayPars(tr) <- list(
+    fontsize=6*label_cex, fontsize.group=6*label_cex,
+    fontface=1, fontcolor="black", fontcolor.group="black",
+    col=label_color, fill=grDevices::adjustcolor(label_color, alpha.f=0.00),
+    lwd=2, stackHeight=2.5
+  )
+  tr
+}
+make_histone_datatrack <- function(ct, mark, chr, from, to, tagalign_files, histone_marks,
+                                   genome="hg38", color="#e74c3c", max_bins=500L){
+  ct_files <- tagalign_files[[ct]]
+  if(is.null(ct_files)) return(NULL)
+  if(length(ct_files)==length(histone_marks)) names(ct_files) <- histone_marks
+  fpath <- ct_files[[mark]]
+  if(is.null(fpath) || !file.exists(fpath)) return(NULL)
+  tag_gr <- get_tagalign_gr_cached(fpath)
+  if(!length(tag_gr)) return(NULL)
+  style <- if(grepl("^chr", chr)) "UCSC" else "NCBI"
+  try(suppressWarnings(GenomeInfoDb::seqlevelsStyle(tag_gr) <- style), silent=TRUE)
+  tag_gr <- tag_gr[as.character(GenomicRanges::seqnames(tag_gr)) == chr]
+  if(!length(tag_gr)) return(NULL)
+  region <- GenomicRanges::GRanges(chr, IRanges::IRanges(from, to))
+  hits <- GenomicRanges::findOverlaps(tag_gr, region, ignore.strand=TRUE)
+  tag_gr <- tag_gr[S4Vectors::queryHits(hits)]
+  if(!length(tag_gr)) return(NULL)
+  cov_list <- GenomicRanges::coverage(tag_gr)
+  if(!(chr %in% names(cov_list))) return(NULL)
+  cov_chr <- cov_list[[chr]]
+  from <- max(1L, as.integer(from)); to <- min(as.integer(to), length(cov_chr))
+  if(from>to) return(NULL)
+  cov_win <- cov_chr[from:to]
+  bin_size <- max(1L, as.integer(ceiling(length(cov_win)/max_bins)))
+  starts <- seq.int(1L, length(cov_win), by=bin_size)
+  ends <- pmin(starts + bin_size - 1L, length(cov_win))
+  means <- as.numeric(IRanges::viewMeans(IRanges::Views(cov_win, starts, ends)))
+  gr_bins <- GenomicRanges::GRanges(chr, IRanges::IRanges(from + starts - 1L, from + ends - 1L))
+  S4Vectors::mcols(gr_bins)$score <- means
+  Gviz::DataTrack(
+    range=gr_bins, genome=genome, chromosome=chr, type="histogram",
+    name=paste0(ct," ",mark), col.histogram=color, fill.histogram=color,
+    ylim=c(0, max(1, max(means, na.rm=TRUE))),
+    background.title="white", col.axis="black", col.title="black"
+  )
+}
+plot_promoter_binding_pdf <- function(genes, prom_ranges, remap_tf_peaks, prom_acc_list,
+                                      flank=1000L, genome="hg38", pdf_file=tracks_pdf,
+                                      cell_types=names(tagalign_files),
+                                      show_only_accessible=FALSE, tagalign_files,
+                                      histone_marks, marks_to_plot=c("H3K27ac","H3K4me1")){
+  pdf(pdf_file, width=11, height=18); on.exit(dev.off(), add=TRUE)
+  for(g in genes){
+    if(!(g %in% names(prom_ranges))) next
+    gp <- prom_ranges[g]; chr <- as.character(GenomicRanges::seqnames(gp))
+    from <- max(1, GenomicRanges::start(gp)-flank); to <- GenomicRanges::end(gp)+flank
+    axisTrack <- Gviz::GenomeAxisTrack()
+    promTrack <- Gviz::AnnotationTrack(gp, genome=genome, name=paste0(g," promoter"),
+                                       chromosome=chr, fill="#dddddd", col="#888",
+                                       background.title="white")
+    tracks_list <- list(axisTrack, promTrack)
+    sizes_vec   <- c(0.6, 1.0)
+    ov_gene <- GenomicRanges::findOverlaps(remap_tf_peaks, gp, ignore.strand=TRUE)
+    gene_tf_peaks <- if(length(ov_gene)) remap_tf_peaks[S4Vectors::queryHits(ov_gene)] else GenomicRanges::GRanges()
+    for(ct in cell_types){
+      acc_prom <- prom_acc_list[[ct]]
+      promoter_accessible <- !is.null(acc_prom) && length(acc_prom) && g %in% names(acc_prom)
+      status <- if(promoter_accessible) "TF (acc)" else "TF (not acc)"
+      tf_track <- make_tf_annotation_track(
+        gene_tf_peaks, genome, chr,
+        name_prefix=paste0(ct," ",status),
+        label_color=ct_colors[[ct]] %||% "#444444",
+        label_cex=0.85
+      )
+      tracks_list[[length(tracks_list)+1]] <- tf_track
+      sizes_vec <- c(sizes_vec, if(length(gene_tf_peaks)) 4.0 else 2.0)
+      for(mk in marks_to_plot){
+        col <- mark_colors[[mk]] %||% "#999999"
+        dt_hist <- try(make_histone_datatrack(ct, mk, chr, from, to, tagalign_files, histone_marks,
+                                              genome=genome, color=col), silent=TRUE)
+        if(!inherits(dt_hist,"try-error") && !is.null(dt_hist)){
+          tracks_list[[length(tracks_list)+1]] <- dt_hist
+          sizes_vec <- c(sizes_vec, 1.2)
+        }
+      }
+    }
+    grid::grid.newpage()
+    grid::pushViewport(grid::viewport(layout=grid::grid.layout(nrow=1, ncol=2,
+                                                               widths=grid::unit(c(2.0, 9.0), "inches"))))
+    grid::pushViewport(grid::viewport(layout.pos.row=1, layout.pos.col=1))
+    grid::grid.rect(gp=grid::gpar(fill="white", col=NA))
+    grid::grid.text(paste0(g," promoter"), x=0.5, y=0.95,
+                    gp=grid::gpar(fontface="bold", cex=1.1))
+    y <- 0.88
+    grid::grid.text("Cell types", x=0.5, y=y, gp=grid::gpar(fontface="bold", cex=0.9))
+    y <- y - 0.05
+    for(ct in cell_types){
+      grid::grid.rect(x=0.2, y=y, width=0.25, height=0.04,
+                      gp=grid::gpar(fill=ct_colors[[ct]] %||% "#777777", col="grey30"))
+      grid::grid.text(ct, x=0.55, y=y, just="left", gp=grid::gpar(cex=0.8))
+      y <- y - 0.055
+    }
+    grid::grid.text("Histone marks", x=0.5, y=y-0.02, gp=grid::gpar(fontface="bold", cex=0.9))
+    y <- y - 0.06
+    for(mk in c("H3K27ac","H3K4me1")){
+      grid::grid.rect(x=0.2, y=y, width=0.25, height=0.04,
+                      gp=grid::gpar(fill=mark_colors[[mk]] %||% "#999999", col="grey30"))
+      grid::grid.text(mk, x=0.55, y=y, just="left", gp=grid::gpar(cex=0.8))
+      y <- y - 0.055
+    }
+    grid::popViewport()
+    grid::pushViewport(grid::viewport(layout.pos.row=1, layout.pos.col=2))
+    Gviz::plotTracks(tracks_list,
+                     from=from, to=to, chromosome=chr,
+                     main=paste0(g," promoter TF binding + histone signals (hg38)"),
+                     cex.main=1, background.title="white", sizes=sizes_vec, add=TRUE)
+    grid::popViewport(); grid::popViewport()
+  }
+  message("Promoter binding tracks saved: ", pdf_file)
+}
+`%||%` <- function(a,b) if(!is.null(a)) a else b
+plot_promoter_binding_pdf(
+  genes=genes_of_interest, prom_ranges=prom_sel,
+  remap_tf_peaks=remap_promoter, prom_acc_list=prom_acc_list,
+  flank=1000L, genome="hg38", pdf_file=tracks_pdf,
+  cell_types=names(tagalign_files), tagalign_files=tagalign_files,
+  histone_marks=histone_marks, marks_to_plot=histone_marks
+)
+
+############################
+# 11) SAVE OUTPUTS
+############################
+data.table::fwrite(promoter_tf_binding, file.path(getwd(),"promoter_tf_binding_metrics.csv"))
+if(nrow(promoter_tf_binding_ct))
+  data.table::fwrite(promoter_tf_binding_ct, file.path(getwd(),"promoter_tf_binding_metrics_by_celltype.csv"))
+
+############################
+# 12) SUMMARY
+############################
+message("Pipeline complete:
+ - promoter_binding_tracks PDF: ", tracks_pdf,
+        "\n - promoter_tf_binding rows: ", nrow(promoter_tf_binding),
+        "\n - promoter_tf_binding_ct rows: ", nrow(promoter_tf_binding_ct),
+        "\n - Other PDFs: \n   ", plot_global_pdf, "\n   ", plot_celltype_pdf,
+        "\n - Final promoter intensity metric: Promoter_FinalBIS",
+        "\n - Composite used for promoter plots: ", selected_composite_name,
+        if(use_global_scalers) "\n - Global background scalers applied." else "")
+
+############################################################
+# END
+############################################################
+
